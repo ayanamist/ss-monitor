@@ -50,27 +50,6 @@ type dataRow struct {
 const (
 	indexFile = "index.htm"
 	checkURL  = "http://connectivitycheck.gstatic.com/generate_204"
-	htmlTpl   = `<!DOCTYPE html>
-<html>
-<header>
-<title>System Status</title>
-<meta charset="UTF-8"/>
-</header>
-<body>
-<table>
-<tr>
-<th></th>
-{{range .Names}}<th>{{.}}</th>{{end}}
-</tr>
-{{range .Rows}}
-<tr>
-	<td>{{.Time}}</td>
-	{{range .RtList}}<td>{{.}}</td>{{end}}
-</tr>
-{{end}}
-</table>
-</body>
-</html>`
 )
 
 var (
@@ -264,7 +243,8 @@ func renderIndex() {
 			RtList []int32
 		}{timestamp, rts})
 	}
-	tpl, err := template.New("index").Parse(htmlTpl)
+	tplFile := indexFile + ".tpl"
+	tpl, err := template.New(tplFile).ParseFiles(filepath.Join(baseDirPath, tplFile))
 	if err != nil {
 		log.Fatalf("template parse: %v", err)
 	}
