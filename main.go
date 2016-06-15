@@ -19,6 +19,8 @@ import (
 
 	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 	yaml "gopkg.in/yaml.v2"
+	"bufio"
+	"strconv"
 )
 
 type SiteConfig struct {
@@ -28,6 +30,7 @@ type SiteConfig struct {
 
 type Config struct {
 	HttpPort string       `yaml:"http_port"`
+	OldestHistory int `yaml:"oldest_history"`
 	Sites    []SiteConfig `yaml:"sites"`
 }
 
@@ -51,16 +54,14 @@ const (
 <header>
 <title>System Status</title>
 <meta charset="UTF-8"/>
-<style>
-body {
-	font-family: monospace;
-}
-</style>
 </header>
 <body>
-<pre>
-%s
-</pre>
+<table>
+<tr>{{range .names}}<th>{{.}}</th>{{end}}</tr>
+{{range .rows}}
+<tr></tr>
+{{end}}
+</table>
 </body>
 </html>
 	`
@@ -68,6 +69,8 @@ body {
 
 var (
 	cfg         = Config{}
+	namesList = []string{}
+	namesSet = map[string]bool{}
 	baseDirPath string
 	baseDirFile *os.File
 	rows        = []dataRow{}
@@ -172,7 +175,9 @@ func readConfig() {
 	if cfg.HttpPort == "" {
 		log.Fatal("http_port must be specified")
 	}
-	namesSet := map[string]bool{}
+	if cfg.OldestHistory <= 0 {
+		cfg.OldestHistory = 60
+	}
 	for i := 0; i < len(cfg.Sites); i++ {
 		site := &cfg.Sites[i]
 		site.Name = strings.TrimSpace(site.Name)
@@ -183,6 +188,7 @@ func readConfig() {
 			log.Fatal("name must be unique")
 		}
 		namesSet[site.Name] = true
+		namesList = append(namesList, site.Name)
 		site.Url, err = convertSsURL(strings.TrimSpace(site.Url))
 		if err != nil {
 			log.Fatalf("url: %s error: %v", site.Url, err)
@@ -196,8 +202,12 @@ func dropTimeSecond(t time.Time) time.Time {
 
 var resultChan = make(chan benchmarkResult)
 
+func dataFileName(t time.Time) string {
+	return fmt.Sprintf("data.%s.csv", t.Format("2006-01-02"))
+}
+
 func rotateDataFile(oldFile *os.File) (*os.File, error) {
-	newFileName := fmt.Sprintf("data.%s.csv", time.Now().Format("2006-01-02"))
+	newFileName := dataFileName(time.Now())
 	if filepath.Base(oldFile.Name()) == newFileName {
 		return oldFile, nil
 	}
@@ -213,15 +223,34 @@ func rotateDataFile(oldFile *os.File) (*os.File, error) {
 
 }
 
-func render() {
+func renderIndex() {
 	// TODO
 }
 
-func startCheckers() {
-	names := make([]string, len(cfg.Sites))
-	for i, site := range cfg.Sites {
-		names[i] = site.Name
+func insertSlices(rows []dataRow, i int, row dataRow) ([]dataRow) {
+	return append(rows[:i], append([]dataRow{row}, rows[i:]...)...)
+}
+
+func insertResultIntoRows(result benchmarkResult) int {
+	rowTimestamp := dropTimeSecond(result.startTime).Unix()
+	i := sort.Search(len(rows), func(i int) bool {
+		return rowTimestamp >= rows[i].timestamp
+	})
+	if rows[i].timestamp == rowTimestamp {
+		rows[i].columns[result.name] = result.rt
+	} else {
+		rows = insertSlices(rows, i, dataRow{rowTimestamp, map[string]int32{result.name: result.rt}})
+		if len(rows) > cfg.OldestHistory {
+			rows = rows[:cfg.OldestHistory]
+			if i >= cfg.OldestHistory {
+				i = cfg.OldestHistory - 1
+			}
+		}
 	}
+	return i
+}
+
+func startCheckers() {
 	go func() {
 		var err error
 		var f *os.File
@@ -236,22 +265,13 @@ func startCheckers() {
 			if _, err := f.WriteString(line); err != nil {
 				panic(err)
 			}
-
-			rowTimestamp := dropTimeSecond(result.startTime).Unix()
-			i := sort.Search(len(rows), func(i int) bool {
-				return rowTimestamp <= rows[i].timestamp
-			})
-			if rows[i].timestamp == rowTimestamp {
-				rows[i].columns[result.name] = result.rt
-			} else {
-				rows = append(rows[:i], append([]dataRow{dataRow{rowTimestamp, map[string]int32{result.name: result.rt}}}, rows[i:]...)...)
-			}
-			if len(rows[i].columns) == len(names) {
+			i := insertResultIntoRows(result)
+			if len(rows[i].columns) == len(namesList) {
 				f, err = rotateDataFile(f)
 				if err != nil {
 					panic(err)
 				}
-				render()
+				renderIndex()
 			}
 		}
 	}()
@@ -271,6 +291,46 @@ func startCheckers() {
 		}
 
 	}()
+}
+
+func loadFiles() {
+	now := time.Now()
+	for len(rows) < cfg.OldestHistory {
+		path := filepath.Join(baseDirPath, dataFileName(now))
+		f, err := os.Open(path)
+		if err != nil {
+			log.Printf("open %s error: %v", path, err)
+			break
+		}
+		defer f.Close()
+		reader := bufio.NewReader(f)
+		for len(rows) < cfg.OldestHistory {
+			bytes, _, err := reader.ReadLine()
+			if err != nil  {
+				if err != io.EOF {
+					log.Printf("read %s error: %v", path, err)
+				}
+				break
+			}
+			splitted := strings.SplitN(string(bytes), ",", 3)
+			if len(splitted) != 3 {
+				continue
+			}
+			timestamp, err := strconv.ParseUint(splitted[0], 10, 0)
+			if err != nil {
+				log.Printf("strconv timestamp %s error: %v", splitted[0], err)
+				continue
+			}
+			rt, err := strconv.ParseInt(splitted[2], 10, 0)
+			if err != nil {
+				log.Printf("strconv rt %s error: %v", splitted[2], err)
+				continue
+			}
+			result := benchmarkResult{splitted[1], int32(rt), time.Unix(int64(timestamp), 0)}
+			insertResultIntoRows(result)
+		}
+		now = now.AddDate(0, 0, -1)
+	}
 }
 
 func startHTTPServer() {
@@ -297,7 +357,8 @@ func startHTTPServer() {
 func main() {
 	var err error
 	readConfig()
-	log.Printf("baseDir: %s", baseDirPath)
+	log.Printf("base dir: %s", baseDirPath)
+	log.Printf("oldest history in minutes: %d", cfg.OldestHistory)
 	baseDirFile, err = os.Open(baseDirPath)
 	if err != nil {
 		panic(err)
@@ -306,6 +367,7 @@ func main() {
 		baseDirFile.Sync()
 		baseDirFile.Close()
 	}()
+	loadFiles()
 	startCheckers()
 	startHTTPServer()
 }
