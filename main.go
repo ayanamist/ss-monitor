@@ -92,6 +92,11 @@ type Config struct {
 	Sites []SiteConfig `yaml:"sites"`
 }
 
+type Result struct {
+	name string
+	rt   int32
+}
+
 var dir string
 
 func readConfig() *Config {
@@ -120,9 +125,13 @@ func readConfig() *Config {
 	return &cfg
 }
 
+func dropTimeSecond(t time.Time) time.Time {
+	return time.Unix(t.Unix()-int64(t.Second()), 0)
+}
+
 func startCheckers(cfg *Config) {
 	go func() {
-		resultChan := make(chan string)
+		resultChan := make(chan Result)
 		go func() {
 			fileName := ""
 			var f *os.File
@@ -133,7 +142,10 @@ func startCheckers(cfg *Config) {
 			}()
 			var err error
 			for {
-				line := <-resultChan
+				result := <-resultChan
+				now := time.Now()
+				line := fmt.Sprintf("%d,%s,%d", now.Unix(), result.name, result.rt)
+
 				newFileName := fmt.Sprintf("data.%s.csv", time.Now().Format("2006-01-02"))
 				if fileName != newFileName {
 					if f != nil {
@@ -158,7 +170,7 @@ func startCheckers(cfg *Config) {
 					log.Printf("testing %s", site.Name)
 					rt, err := testOne(site.Url)
 					log.Printf("%s rt: %d ms, error: %v", site.Name, rt, err)
-					resultChan <- fmt.Sprintf("%d,%s,%d", time.Now().Unix(), site.Name, rt)
+					resultChan <- Result{site.Name, rt}
 				}(site)
 			}
 			time.Sleep(1 * time.Minute)
