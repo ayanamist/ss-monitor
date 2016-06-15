@@ -383,8 +383,13 @@ func startHTTPServer() {
 	if !strings.Contains(cfg.HttpPort, ":") {
 		cfg.HttpPort = ":" + cfg.HttpPort
 	}
-	log.Printf("listen on %s", cfg.HttpPort)
-	if err := http.ListenAndServe(cfg.HttpPort, nil); err != nil {
+	server := &http.Server{Addr: cfg.HttpPort, Handler: nil}
+	ln, err := net.Listen("tcp", cfg.HttpPort)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("listen on %s", ln.Addr().String())
+	if err := server.Serve(ln); err != nil {
 		log.Fatal(err)
 	}
 }

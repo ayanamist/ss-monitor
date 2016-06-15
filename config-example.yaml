@@ -1,4 +1,4 @@
-http_port: 127.0.0.1:8080
+http_port: 127.0.0.1:0
 oldest_history: 60
 sites:
 - name: server1
