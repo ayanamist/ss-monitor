@@ -45,6 +45,14 @@ type dataRow struct {
 	columns   map[string]int32
 }
 
+type htmlData struct {
+	names []string
+	rts []struct {
+		timestamp int64
+		rts []int32
+	}
+}
+
 const (
 	indexFile = "index.htm"
 	checkURL  = "http://connectivitycheck.gstatic.com/generate_204"
@@ -57,9 +65,15 @@ const (
 </header>
 <body>
 <table>
-<tr>{{range .names}}<th>{{.}}</th>{{end}}</tr>
+<tr>
+<th></th>
+{{range .names}}<th>{{.}}</th>{{end}}
+</tr>
 {{range .rows}}
-<tr></tr>
+<tr>
+	<td>{{.timestamp}}<td>
+	{{range .rts}}<td>{{.}}</td>{{end}}
+</tr>
 {{end}}
 </table>
 </body>
@@ -321,12 +335,16 @@ func loadFiles() {
 				log.Printf("strconv timestamp %s error: %v", splitted[0], err)
 				continue
 			}
+			name := splitted[1]
+			if _, ok := namesSet[name]; !ok {
+				continue;
+			}
 			rt, err := strconv.ParseInt(splitted[2], 10, 0)
 			if err != nil {
 				log.Printf("strconv rt %s error: %v", splitted[2], err)
 				continue
 			}
-			result := benchmarkResult{splitted[1], int32(rt), time.Unix(int64(timestamp), 0)}
+			result := benchmarkResult{name, int32(rt), time.Unix(int64(timestamp), 0)}
 			insertResultIntoRows(result)
 		}
 		now = now.AddDate(0, 0, -1)
