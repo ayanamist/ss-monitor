@@ -13,14 +13,16 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"text/template"
 	"time"
 
 	"io"
 
-	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
-	yaml "gopkg.in/yaml.v2"
 	"bufio"
 	"strconv"
+
+	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
+	yaml "gopkg.in/yaml.v2"
 )
 
 type SiteConfig struct {
@@ -29,9 +31,9 @@ type SiteConfig struct {
 }
 
 type Config struct {
-	HttpPort string       `yaml:"http_port"`
-	OldestHistory int `yaml:"oldest_history"`
-	Sites    []SiteConfig `yaml:"sites"`
+	HttpPort      string       `yaml:"http_port"`
+	OldestHistory int          `yaml:"oldest_history"`
+	Sites         []SiteConfig `yaml:"sites"`
 }
 
 type benchmarkResult struct {
@@ -45,19 +47,10 @@ type dataRow struct {
 	columns   map[string]int32
 }
 
-type htmlData struct {
-	names []string
-	rts []struct {
-		timestamp int64
-		rts []int32
-	}
-}
-
 const (
 	indexFile = "index.htm"
 	checkURL  = "http://connectivitycheck.gstatic.com/generate_204"
-	htmlTpl   = `
-<!DOCTYPE html>
+	htmlTpl   = `<!DOCTYPE html>
 <html>
 <header>
 <title>System Status</title>
@@ -67,24 +60,23 @@ const (
 <table>
 <tr>
 <th></th>
-{{range .names}}<th>{{.}}</th>{{end}}
+{{range .Names}}<th>{{.}}</th>{{end}}
 </tr>
-{{range .rows}}
+{{range .Rows}}
 <tr>
-	<td>{{.timestamp}}<td>
-	{{range .rts}}<td>{{.}}</td>{{end}}
+	<td>{{.Time}}</td>
+	{{range .RtList}}<td>{{.}}</td>{{end}}
 </tr>
 {{end}}
 </table>
 </body>
-</html>
-	`
+</html>`
 )
 
 var (
 	cfg         = Config{}
-	namesList = []string{}
-	namesSet = map[string]bool{}
+	namesList   = []string{}
+	namesSet    = map[string]bool{}
 	baseDirPath string
 	baseDirFile *os.File
 	rows        = []dataRow{}
@@ -222,11 +214,13 @@ func dataFileName(t time.Time) string {
 
 func rotateDataFile(oldFile *os.File) (*os.File, error) {
 	newFileName := dataFileName(time.Now())
-	if filepath.Base(oldFile.Name()) == newFileName {
-		return oldFile, nil
+	if oldFile != nil {
+		if filepath.Base(oldFile.Name()) == newFileName {
+			return oldFile, nil
+		}
+		oldFile.Sync()
+		oldFile.Close()
 	}
-	oldFile.Sync()
-	oldFile.Close()
 	f, err := os.OpenFile(filepath.Join(baseDirPath, newFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
@@ -238,10 +232,49 @@ func rotateDataFile(oldFile *os.File) (*os.File, error) {
 }
 
 func renderIndex() {
-	// TODO
+	path := filepath.Join(baseDirPath, indexFile)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		log.Printf("open %s error: %v", path, err)
+		return
+	}
+	defer f.Close()
+	data := struct {
+		Names []string
+		Rows  []struct {
+			Time   string
+			RtList []int32
+		}
+		GeneratedTime string
+	}{}
+	data.Names = namesList
+	data.GeneratedTime = time.Now().Format("2006-01-02 15:04:05")
+	for _, row := range rows {
+		rts := []int32{}
+		for _, name := range namesList {
+			rt, ok := row.columns[name]
+			if !ok {
+				rt = -1
+			}
+			rts = append(rts, rt)
+		}
+		timestamp := time.Unix(row.timestamp, 0).Format("2006-01-02 15:04")
+		data.Rows = append(data.Rows, struct {
+			Time   string
+			RtList []int32
+		}{timestamp, rts})
+	}
+	tpl, err := template.New("index").Parse(htmlTpl)
+	if err != nil {
+		log.Fatalf("template parse: %v", err)
+	}
+	if err := tpl.Execute(f, data); err != nil {
+		log.Fatalf("template execute: %v", err)
+	}
+	log.Print("render index complete")
 }
 
-func insertSlices(rows []dataRow, i int, row dataRow) ([]dataRow) {
+func insertSlices(rows []dataRow, i int, row dataRow) []dataRow {
 	return append(rows[:i], append([]dataRow{row}, rows[i:]...)...)
 }
 
@@ -250,7 +283,7 @@ func insertResultIntoRows(result benchmarkResult) int {
 	i := sort.Search(len(rows), func(i int) bool {
 		return rowTimestamp >= rows[i].timestamp
 	})
-	if rows[i].timestamp == rowTimestamp {
+	if len(rows) > 0 && rows[i].timestamp == rowTimestamp {
 		rows[i].columns[result.name] = result.rt
 	} else {
 		rows = insertSlices(rows, i, dataRow{rowTimestamp, map[string]int32{result.name: result.rt}})
@@ -267,7 +300,7 @@ func insertResultIntoRows(result benchmarkResult) int {
 func startCheckers() {
 	go func() {
 		var err error
-		var f *os.File
+		f, err := rotateDataFile(nil)
 		defer func() {
 			if f != nil {
 				f.Close()
@@ -275,7 +308,7 @@ func startCheckers() {
 		}()
 		for {
 			result := <-resultChan
-			line := fmt.Sprintf("%d,%s,%d", result.startTime.Unix(), result.name, result.rt)
+			line := fmt.Sprintf("%d,%s,%d\n", result.startTime.Unix(), result.name, result.rt)
 			if _, err := f.WriteString(line); err != nil {
 				panic(err)
 			}
@@ -311,6 +344,10 @@ func loadFiles() {
 	now := time.Now()
 	for len(rows) < cfg.OldestHistory {
 		path := filepath.Join(baseDirPath, dataFileName(now))
+		if stat, err := os.Stat(path); err != nil || stat.IsDir() {
+			log.Printf("file %s not exist", path)
+			break
+		}
 		f, err := os.Open(path)
 		if err != nil {
 			log.Printf("open %s error: %v", path, err)
@@ -320,7 +357,7 @@ func loadFiles() {
 		reader := bufio.NewReader(f)
 		for len(rows) < cfg.OldestHistory {
 			bytes, _, err := reader.ReadLine()
-			if err != nil  {
+			if err != nil {
 				if err != io.EOF {
 					log.Printf("read %s error: %v", path, err)
 				}
@@ -337,7 +374,7 @@ func loadFiles() {
 			}
 			name := splitted[1]
 			if _, ok := namesSet[name]; !ok {
-				continue;
+				continue
 			}
 			rt, err := strconv.ParseInt(splitted[2], 10, 0)
 			if err != nil {
