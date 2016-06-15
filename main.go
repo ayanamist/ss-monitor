@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,8 +19,52 @@ import (
 	yaml "gopkg.in/yaml.v2"
 )
 
+type SiteConfig struct {
+	Name string `yaml:"name"`
+	Url  string `yaml:"url"`
+}
+
+type Config struct {
+	Sites []SiteConfig `yaml:"sites"`
+}
+
+type benchmarkResult struct {
+	name      string
+	rt        int32
+	startTime time.Time
+}
+
+type dataRow struct {
+	timestamp int64
+	columns   map[string]int32
+}
+
 const (
 	checkURL = "http://connectivitycheck.gstatic.com/generate_204"
+	htmlTpl  = `
+<html>
+<header>
+<title>System Status</title>
+<meta charset="UTF-8"/>
+<style>
+body {
+	font-family: monospace;
+}
+</style>
+</header>
+<body>
+<pre>
+%s
+</pre>
+</body>
+</html>
+	`
+)
+
+var (
+	rows        = []dataRow{}
+	baseDirPath string
+	baseDirFile *os.File
 )
 
 func makeTimestamp() int64 {
@@ -95,44 +140,28 @@ func testOne(strURL string) (rt int32, err error) {
 	return rt, nil
 }
 
-type SiteConfig struct {
-	Name string `yaml:"name"`
-	Url  string `yaml:"url"`
-}
-
-type Config struct {
-	Sites []SiteConfig `yaml:"sites"`
-}
-
-type Result struct {
-	name string
-	rt   int32
-}
-
-var dir string
-
 func readConfig() *Config {
 	var err error
-	dir, err = filepath.Abs(filepath.Dir(os.Args[0]))
+	baseDirPath, err = filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
 	cfg := Config{}
-	path := filepath.Join(dir, "config.yaml")
+	path := filepath.Join(baseDirPath, "config.yaml")
 	if stat, err := os.Stat(path); err != nil || stat.IsDir() {
-		dir, err = os.Getwd()
+		baseDirPath, err = os.Getwd()
 		if err != nil {
-			log.Fatal(err)
+			panic(err)
 		}
-		path = filepath.Join(dir, "config.yaml")
+		path = filepath.Join(baseDirPath, "config.yaml")
 	}
 	b, err := ioutil.ReadFile(path)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	if err := yaml.Unmarshal([]byte(b), &cfg); err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 	return &cfg
 }
@@ -141,48 +170,77 @@ func dropTimeSecond(t time.Time) time.Time {
 	return time.Unix(t.Unix()-int64(t.Second()), 0)
 }
 
-func startCheckers(cfg *Config) {
-	go func() {
-		resultChan := make(chan Result)
-		go func() {
-			fileName := ""
-			var f *os.File
-			defer func() {
-				if f != nil {
-					f.Close()
-				}
-			}()
-			var err error
-			for {
-				result := <-resultChan
-				now := time.Now()
-				line := fmt.Sprintf("%d,%s,%d", now.Unix(), result.name, result.rt)
+var resultChan = make(chan benchmarkResult)
 
-				newFileName := fmt.Sprintf("data.%s.csv", time.Now().Format("2006-01-02"))
-				if fileName != newFileName {
-					if f != nil {
-						f.Close()
-						f = nil
-					}
-					fileName = newFileName
-					f, err = os.OpenFile(filepath.Join(dir, fileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-					if err != nil {
-						panic(err)
-					}
-					log.Printf("rotate to %s", fileName)
-				}
-				if _, err := f.WriteString(line); err != nil {
-					panic(err)
-				}
+func rotateDataFile(oldFile *os.File) (*os.File, error) {
+	newFileName := fmt.Sprintf("data.%s.csv", time.Now().Format("2006-01-02"))
+	if oldFile.Name() == newFileName {
+		return oldFile, nil
+	}
+	oldFile.Sync()
+	oldFile.Close()
+	f, err := os.OpenFile(filepath.Join(baseDirPath, newFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("rotate to %s", newFileName)
+	baseDirFile.Sync()
+	return f, nil
+
+}
+
+func render() {
+	// TODO
+}
+
+func startCheckers(cfg *Config) {
+	names := make([]string, len(cfg.Sites))
+	for i, site := range cfg.Sites {
+		names[i] = site.Name
+	}
+	go func() {
+		var err error
+		var f *os.File
+		defer func() {
+			if f != nil {
+				f.Close()
 			}
 		}()
 		for {
+			result := <-resultChan
+			line := fmt.Sprintf("%d,%s,%d", result.startTime.Unix(), result.name, result.rt)
+			if _, err := f.WriteString(line); err != nil {
+				panic(err)
+			}
+
+			rowTimestamp := dropTimeSecond(result.startTime).Unix()
+			i := sort.Search(len(rows), func(i int) bool {
+				return rowTimestamp <= rows[i].timestamp
+			})
+			if rows[i].timestamp == rowTimestamp {
+				rows[i].columns[result.name] = result.rt
+			} else {
+				rows = append(rows[:i], append([]dataRow{dataRow{rowTimestamp, map[string]int32{result.name: result.rt}}}, rows[i:]...)...)
+			}
+			if len(rows[i].columns) == len(names) {
+				f, err = rotateDataFile(f)
+				if err != nil {
+					panic(err)
+				}
+				render()
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			startTime := time.Now()
 			for _, site := range cfg.Sites {
 				go func(site SiteConfig) {
 					log.Printf("testing %s", site.Name)
 					rt, err := testOne(site.Url)
 					log.Printf("%s rt: %d ms, error: %v", site.Name, rt, err)
-					resultChan <- Result{site.Name, rt}
+					resultChan <- benchmarkResult{site.Name, rt, startTime}
 				}(site)
 			}
 			time.Sleep(1 * time.Minute)
@@ -191,9 +249,23 @@ func startCheckers(cfg *Config) {
 	}()
 }
 
+func startHTTPServer() {
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal(err)
+	}
+}
+
 func main() {
-	cfg := readConfig()
 	var err error
+	cfg := readConfig()
+	baseDirFile, err = os.Open(baseDirPath)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		baseDirFile.Sync()
+		baseDirFile.Close()
+	}()
 	for i := 0; i < len(cfg.Sites); i++ {
 		site := &cfg.Sites[i]
 		site.Url, err = convertSsURL(site.Url)
@@ -203,5 +275,5 @@ func main() {
 	}
 	log.Printf("config: %vv", cfg)
 	startCheckers(cfg)
-
+	startHTTPServer()
 }
