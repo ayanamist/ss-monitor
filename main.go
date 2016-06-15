@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"io"
+
 	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 	yaml "gopkg.in/yaml.v2"
 )
@@ -25,7 +27,8 @@ type SiteConfig struct {
 }
 
 type Config struct {
-	Sites []SiteConfig `yaml:"sites"`
+	HttpPort string       `yaml:"http_port"`
+	Sites    []SiteConfig `yaml:"sites"`
 }
 
 type benchmarkResult struct {
@@ -40,8 +43,9 @@ type dataRow struct {
 }
 
 const (
-	checkURL = "http://connectivitycheck.gstatic.com/generate_204"
-	htmlTpl  = `
+	indexFile = "index.htm"
+	checkURL  = "http://connectivitycheck.gstatic.com/generate_204"
+	htmlTpl   = `
 <html>
 <header>
 <title>System Status</title>
@@ -62,9 +66,10 @@ body {
 )
 
 var (
-	rows        = []dataRow{}
+	cfg         = Config{}
 	baseDirPath string
 	baseDirFile *os.File
+	rows        = []dataRow{}
 )
 
 func makeTimestamp() int64 {
@@ -140,14 +145,13 @@ func testOne(strURL string) (rt int32, err error) {
 	return rt, nil
 }
 
-func readConfig() *Config {
+func readConfig() {
 	var err error
 	baseDirPath, err = filepath.Abs(filepath.Dir(os.Args[0]))
 	if err != nil {
 		panic(err)
 	}
 
-	cfg := Config{}
 	path := filepath.Join(baseDirPath, "config.yaml")
 	if stat, err := os.Stat(path); err != nil || stat.IsDir() {
 		baseDirPath, err = os.Getwd()
@@ -163,7 +167,26 @@ func readConfig() *Config {
 	if err := yaml.Unmarshal([]byte(b), &cfg); err != nil {
 		panic(err)
 	}
-	return &cfg
+	cfg.HttpPort = strings.TrimSpace(cfg.HttpPort)
+	if cfg.HttpPort == "" {
+		log.Fatal("http_port must be specified")
+	}
+	namesSet := map[string]bool{}
+	for i := 0; i < len(cfg.Sites); i++ {
+		site := &cfg.Sites[i]
+		site.Name = strings.TrimSpace(site.Name)
+		if site.Name == "" {
+			log.Fatal("name must be specified")
+		}
+		if _, ok := namesSet[site.Name]; ok {
+			log.Fatal("name must be unique")
+		}
+		namesSet[site.Name] = true
+		site.Url, err = convertSsURL(strings.TrimSpace(site.Url))
+		if err != nil {
+			log.Fatalf("url: %s error: %v", site.Url, err)
+		}
+	}
 }
 
 func dropTimeSecond(t time.Time) time.Time {
@@ -174,7 +197,7 @@ var resultChan = make(chan benchmarkResult)
 
 func rotateDataFile(oldFile *os.File) (*os.File, error) {
 	newFileName := fmt.Sprintf("data.%s.csv", time.Now().Format("2006-01-02"))
-	if oldFile.Name() == newFileName {
+	if filepath.Base(oldFile.Name()) == newFileName {
 		return oldFile, nil
 	}
 	oldFile.Sync()
@@ -193,7 +216,7 @@ func render() {
 	// TODO
 }
 
-func startCheckers(cfg *Config) {
+func startCheckers() {
 	names := make([]string, len(cfg.Sites))
 	for i, site := range cfg.Sites {
 		names[i] = site.Name
@@ -250,14 +273,29 @@ func startCheckers(cfg *Config) {
 }
 
 func startHTTPServer() {
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		f, err := os.Open(filepath.Join(baseDirPath, indexFile))
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("not found"))
+			return
+		}
+		defer f.Close()
+		io.Copy(w, f)
+	})
+	if !strings.Contains(cfg.HttpPort, ":") {
+		cfg.HttpPort = ":" + cfg.HttpPort
+	}
+	log.Printf("listen on %s", cfg.HttpPort)
+	if err := http.ListenAndServe(cfg.HttpPort, nil); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func main() {
 	var err error
-	cfg := readConfig()
+	readConfig()
+	log.Printf("baseDir: %s", baseDirPath)
 	baseDirFile, err = os.Open(baseDirPath)
 	if err != nil {
 		panic(err)
@@ -266,14 +304,6 @@ func main() {
 		baseDirFile.Sync()
 		baseDirFile.Close()
 	}()
-	for i := 0; i < len(cfg.Sites); i++ {
-		site := &cfg.Sites[i]
-		site.Url, err = convertSsURL(site.Url)
-		if err != nil {
-			log.Fatalf("url: %s error: %v", site.Url, err)
-		}
-	}
-	log.Printf("config: %vv", cfg)
-	startCheckers(cfg)
+	startCheckers()
 	startHTTPServer()
 }
