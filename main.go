@@ -123,17 +123,17 @@ func readConfig() *Config {
 func startCheckers(cfg *Config) {
 	go func() {
 		resultChan := make(chan string)
-		go func ()  {
+		go func() {
 			fileName := ""
 			var f *os.File
-			defer func ()  {
+			defer func() {
 				if f != nil {
 					f.Close()
 				}
 			}()
 			var err error
 			for {
-				line := <- resultChan
+				line := <-resultChan
 				newFileName := fmt.Sprintf("data.%s.csv", time.Now().Format("2006-01-02"))
 				if fileName != newFileName {
 					if f != nil {
