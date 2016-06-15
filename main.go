@@ -46,6 +46,7 @@ const (
 	indexFile = "index.htm"
 	checkURL  = "http://connectivitycheck.gstatic.com/generate_204"
 	htmlTpl   = `
+<!DOCTYPE html>
 <html>
 <header>
 <title>System Status</title>
@@ -281,6 +282,7 @@ func startHTTPServer() {
 			return
 		}
 		defer f.Close()
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
 		io.Copy(w, f)
 	})
 	if !strings.Contains(cfg.HttpPort, ":") {
