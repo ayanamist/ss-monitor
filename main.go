@@ -58,14 +58,26 @@ func testOne(strURL string) (rt int32, err error) {
 		return -1, err
 	}
 
+	conn, err := net.DialTimeout("tcp", ssURL.Host, 5*time.Second)
+	if err != nil {
+		return -1, err
+	}
+	defer conn.Close()
+	c := ss.NewConn(conn, cipher)
+
 	tr := &http.Transport{
 		Dial: func(network, addr string) (net.Conn, error) {
 			rawAddr, err := ss.RawAddr(addr)
 			if err != nil {
 				return nil, err
 			}
-			return ss.DialWithRawAddr(rawAddr, ssURL.Host, cipher)
+			if _, err = c.Write(rawAddr); err != nil {
+				c.Close()
+				return nil, err
+			}
+			return c, nil
 		},
+		ResponseHeaderTimeout: 10 * time.Second,
 	}
 	req, err := http.NewRequest("GET", checkURL, nil)
 	if err != nil {
