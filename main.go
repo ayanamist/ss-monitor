@@ -237,7 +237,7 @@ func renderIndex() {
 		for _, name := range namesList {
 			rt, ok := row.columns[name]
 			if !ok {
-				rt = -1
+				rt = 0
 			}
 			rts = append(rts, rt)
 		}
