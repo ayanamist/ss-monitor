@@ -318,9 +318,14 @@ func startCheckers() {
 					var err error
 					var rt int32
 					for retry:= 1; retry <= 3; retry++ {
+						startTime := time.Now().Unix()
 						rt, err = testOne(site.Url)
 						if err != nil {
-							log.Printf("#%d %s rt: %d ms, error: %v", retry, site.Name, rt, err)
+							remain := time.Duration(15 - (time.Now().Unix() - startTime))
+							log.Printf("#%d %s rt: %d ms, error: %v, sleep %ds", retry, site.Name, rt, err, remain)
+							if remain > 0 {
+								time.Sleep(remain * time.Second)
+							}
 						} else {
 							log.Printf("#%d %s rt: %d ms", retry, site.Name, rt)
 							break
