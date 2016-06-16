@@ -1,5 +1,6 @@
 http_port: 127.0.0.1:0
 oldest_history: 60
+slow_threshold: 5000
 sites:
 - name: server1
   url: ss://method:password@host1:port

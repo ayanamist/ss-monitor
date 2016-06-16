@@ -25,7 +25,7 @@
 {{range .Rows}}
 <tr>
 	<td>{{.Time}}</td>
-	{{range .RtList}}<td class="rt-{{if le . 0}}error{{else if ge . 5000}}slow{{else}}normal{{end}}">{{.}}</td>{{end}}
+	{{range .RtList}}<td class="rt-{{if le . 0}}error{{else if isRtSlow .}}slow{{else}}normal{{end}}">{{.}}</td>{{end}}
 </tr>
 {{end}}
 </table>

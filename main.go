@@ -33,6 +33,7 @@ type SiteConfig struct {
 type Config struct {
 	HttpPort      string       `yaml:"http_port"`
 	OldestHistory int          `yaml:"oldest_history"`
+	SlowThreshold int32        `yaml:"slow_threshold"`
 	Sites         []SiteConfig `yaml:"sites"`
 }
 
@@ -163,6 +164,9 @@ func readConfig() {
 	if cfg.OldestHistory <= 0 {
 		cfg.OldestHistory = 60
 	}
+	if cfg.SlowThreshold <= 0 {
+		cfg.SlowThreshold = 5000
+	}
 	for i := 0; i < len(cfg.Sites); i++ {
 		site := &cfg.Sites[i]
 		site.Name = strings.TrimSpace(site.Name)
@@ -244,7 +248,9 @@ func renderIndex() {
 		}{timestamp, rts})
 	}
 	tplFile := indexFile + ".tpl"
-	tpl, err := template.New(tplFile).ParseFiles(filepath.Join(baseDirPath, tplFile))
+	tpl, err := template.New(tplFile).Funcs(map[string]interface{}{"isRtSlow": func (rt int32) bool {
+		return rt >= cfg.SlowThreshold
+	}}).ParseFiles(filepath.Join(baseDirPath, tplFile))
 	if err != nil {
 		log.Fatalf("template parse: %v", err)
 	}
