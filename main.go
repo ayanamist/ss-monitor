@@ -263,7 +263,7 @@ func insertResultIntoRows(result benchmarkResult) int {
 	i := sort.Search(len(rows), func(i int) bool {
 		return rowTimestamp >= rows[i].timestamp
 	})
-	if len(rows) > 0 && rows[i].timestamp == rowTimestamp {
+	if len(rows) > 0 && i < len(rows) && rows[i].timestamp == rowTimestamp {
 		rows[i].columns[result.name] = result.rt
 	} else {
 		rows = insertSlices(rows, i, dataRow{rowTimestamp, map[string]int32{result.name: result.rt}})
