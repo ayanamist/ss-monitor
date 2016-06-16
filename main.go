@@ -198,10 +198,10 @@ func dataFileName(t time.Time) string {
 func rotateDataFile(oldFile *os.File) (*os.File, error) {
 	newFileName := dataFileName(time.Now())
 	if oldFile != nil {
+		oldFile.Sync()
 		if filepath.Base(oldFile.Name()) == newFileName {
 			return oldFile, nil
 		}
-		oldFile.Sync()
 		oldFile.Close()
 	}
 	f, err := os.OpenFile(filepath.Join(baseDirPath, newFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
