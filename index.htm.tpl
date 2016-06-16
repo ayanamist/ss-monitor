@@ -25,19 +25,21 @@
 <span class="generated-time">Generated: {{.GeneratedTime}}</span>
 <table class="table">
 <tr>
-<th></th>
-{{range .Names}}<th>{{.}}</th>{{end}}
+	<th></th>
+	{{- range .Names }}
+	<th>{{.}}</th>
+	{{- end}}
 </tr>
-{{range .Rows}}
+{{- range .Rows}}
 <tr>
 	<td>{{.Time}}</td>
-	{{range .RtList}}
+	{{- range .RtList }}
 	<td class="rt-{{if lt . 0}}error{{else if eq . 0}}none{{else if isRtSlow .}}slow{{else}}normal{{end}}">
-	{{renderRt .}}
+	{{- renderRt . -}}
 	</td>
-	{{end}}
+	{{- end}}
 </tr>
-{{end}}
+{{- end}}
 </table>
 </body>
 </html>
