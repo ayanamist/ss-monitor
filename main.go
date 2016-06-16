@@ -248,7 +248,7 @@ func renderIndex() {
 		}{timestamp, rts})
 	}
 	tplFile := indexFile + ".tpl"
-	tpl, err := template.New(tplFile).Funcs(map[string]interface{}{"isRtSlow": func (rt int32) bool {
+	tpl, err := template.New(tplFile).Funcs(map[string]interface{}{"isRtSlow": func(rt int32) bool {
 		return rt >= cfg.SlowThreshold
 	}}).ParseFiles(filepath.Join(baseDirPath, tplFile))
 	if err != nil {
@@ -311,17 +311,17 @@ func startCheckers() {
 
 	go func() {
 		for {
-			startTime := time.Now()
+			checkStart := time.Now()
 			for _, site := range cfg.Sites {
 				go func(site SiteConfig) {
 					log.Printf("testing %s", site.Name)
 					var err error
 					var rt int32
-					for retry:= 1; retry <= 3; retry++ {
-						startTime := time.Now().Unix()
+					for retry := 1; retry <= 3; retry++ {
+						retryStart := time.Now().Unix()
 						rt, err = testOne(site.Url)
 						if err != nil {
-							remain := time.Duration(15 - (time.Now().Unix() - startTime))
+							remain := time.Duration(15 - (time.Now().Unix() - retryStart))
 							log.Printf("#%d %s rt: %d ms, error: %v, sleep %ds", retry, site.Name, rt, err, remain)
 							if remain > 0 {
 								time.Sleep(remain * time.Second)
@@ -331,7 +331,7 @@ func startCheckers() {
 							break
 						}
 					}
-					resultChan <- benchmarkResult{site.Name, rt, startTime}
+					resultChan <- benchmarkResult{site.Name, rt, checkStart}
 				}(site)
 			}
 			time.Sleep(1 * time.Minute)
