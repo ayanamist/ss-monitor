@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"html/template"
 	"io/ioutil"
 	"log"
 	"net"
@@ -13,7 +14,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"text/template"
 	"time"
 
 	"io"
@@ -33,6 +33,7 @@ type SiteConfig struct {
 type Config struct {
 	HttpPort      string       `yaml:"http_port"`
 	OldestHistory int          `yaml:"oldest_history"`
+	SlowThreshold int32        `yaml:"slow_threshold"`
 	Sites         []SiteConfig `yaml:"sites"`
 }
 
@@ -163,6 +164,9 @@ func readConfig() {
 	if cfg.OldestHistory <= 0 {
 		cfg.OldestHistory = 60
 	}
+	if cfg.SlowThreshold <= 0 {
+		cfg.SlowThreshold = 5000
+	}
 	for i := 0; i < len(cfg.Sites); i++ {
 		site := &cfg.Sites[i]
 		site.Name = strings.TrimSpace(site.Name)
@@ -194,13 +198,13 @@ func dataFileName(t time.Time) string {
 func rotateDataFile(oldFile *os.File) (*os.File, error) {
 	newFileName := dataFileName(time.Now())
 	if oldFile != nil {
+		oldFile.Sync()
 		if filepath.Base(oldFile.Name()) == newFileName {
 			return oldFile, nil
 		}
-		oldFile.Sync()
 		oldFile.Close()
 	}
-	f, err := os.OpenFile(filepath.Join(baseDirPath, newFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(filepath.Join(baseDirPath, newFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +237,7 @@ func renderIndex() {
 		for _, name := range namesList {
 			rt, ok := row.columns[name]
 			if !ok {
-				rt = -1
+				rt = 0
 			}
 			rts = append(rts, rt)
 		}
@@ -244,7 +248,9 @@ func renderIndex() {
 		}{timestamp, rts})
 	}
 	tplFile := indexFile + ".tpl"
-	tpl, err := template.New(tplFile).ParseFiles(filepath.Join(baseDirPath, tplFile))
+	tpl, err := template.New(tplFile).Funcs(map[string]interface{}{"isRtSlow": func(rt int32) bool {
+		return rt >= cfg.SlowThreshold
+	}}).ParseFiles(filepath.Join(baseDirPath, tplFile))
 	if err != nil {
 		log.Fatalf("template parse: %v", err)
 	}
@@ -263,7 +269,7 @@ func insertResultIntoRows(result benchmarkResult) int {
 	i := sort.Search(len(rows), func(i int) bool {
 		return rowTimestamp >= rows[i].timestamp
 	})
-	if len(rows) > 0 && rows[i].timestamp == rowTimestamp {
+	if len(rows) > 0 && i < len(rows) && rows[i].timestamp == rowTimestamp {
 		rows[i].columns[result.name] = result.rt
 	} else {
 		rows = insertSlices(rows, i, dataRow{rowTimestamp, map[string]int32{result.name: result.rt}})
@@ -305,13 +311,27 @@ func startCheckers() {
 
 	go func() {
 		for {
-			startTime := time.Now()
+			checkStart := time.Now()
 			for _, site := range cfg.Sites {
 				go func(site SiteConfig) {
 					log.Printf("testing %s", site.Name)
-					rt, err := testOne(site.Url)
-					log.Printf("%s rt: %d ms, error: %v", site.Name, rt, err)
-					resultChan <- benchmarkResult{site.Name, rt, startTime}
+					var err error
+					var rt int32
+					for retry := 1; retry <= 3; retry++ {
+						retryStart := time.Now().Unix()
+						rt, err = testOne(site.Url)
+						if err != nil {
+							remain := time.Duration(15 - (time.Now().Unix() - retryStart))
+							log.Printf("#%d %s rt: %d ms, error: %v, sleep %ds", retry, site.Name, rt, err, remain)
+							if remain > 0 {
+								time.Sleep(remain * time.Second)
+							}
+						} else {
+							log.Printf("#%d %s rt: %d ms", retry, site.Name, rt)
+							break
+						}
+					}
+					resultChan <- benchmarkResult{site.Name, rt, checkStart}
 				}(site)
 			}
 			time.Sleep(1 * time.Minute)
