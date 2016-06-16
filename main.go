@@ -200,7 +200,7 @@ func rotateDataFile(oldFile *os.File) (*os.File, error) {
 		oldFile.Sync()
 		oldFile.Close()
 	}
-	f, err := os.OpenFile(filepath.Join(baseDirPath, newFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(filepath.Join(baseDirPath, newFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, err
 	}
