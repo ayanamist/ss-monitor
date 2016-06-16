@@ -323,6 +323,7 @@ func startCheckers() {
 						if err != nil {
 							remain := time.Duration(15 - (time.Now().Unix() - retryStart))
 							log.Printf("#%d %s rt: %d ms, error: %v, sleep %ds", retry, site.Name, rt, err, remain)
+							rt = -1
 							if remain > 0 {
 								time.Sleep(remain * time.Second)
 							}
