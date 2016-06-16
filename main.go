@@ -36,6 +36,7 @@ type Config struct {
 	HttpPort      string       `yaml:"http_port"`
 	OldestHistory int          `yaml:"oldest_history"`
 	SlowThreshold int32        `yaml:"slow_threshold"`
+	ShowRT        bool         `yaml:"show_rt"`
 	Sites         []SiteConfig `yaml:"sites"`
 }
 
@@ -250,9 +251,23 @@ func renderIndex() {
 		}{timestamp, rts})
 	}
 	tplFile := indexFile + ".tpl"
-	tpl, err := template.New(tplFile).Funcs(map[string]interface{}{"isRtSlow": func(rt int32) bool {
-		return rt >= cfg.SlowThreshold
-	}}).ParseFiles(filepath.Join(baseDirPath, tplFile))
+	tpl, err := template.New(tplFile).Funcs(map[string]interface{}{
+		"isRtSlow": func(rt int32) bool {
+			return rt >= cfg.SlowThreshold
+		},
+		"renderRt": func(rt int32) string {
+			if rt == 0 {
+				return "-"
+			}
+			if cfg.ShowRT {
+				return strconv.FormatInt(int64(rt), 10)
+			}
+			if rt < 0 {
+				return "ERROR"
+			}
+			return "OK"
+		},
+	}).ParseFiles(filepath.Join(baseDirPath, tplFile))
 	if err != nil {
 		log.Fatalf("template parse: %v", err)
 	}
@@ -300,23 +315,23 @@ func startCheckers() {
 		}()
 		for {
 			select {
-				case result := <-resultChan:
-					line := fmt.Sprintf("%d,%s,%d\n", result.startTime.Unix(), result.name, result.rt)
-					if _, err := f.WriteString(line); err != nil {
+			case result := <-resultChan:
+				line := fmt.Sprintf("%d,%s,%d\n", result.startTime.Unix(), result.name, result.rt)
+				if _, err := f.WriteString(line); err != nil {
+					panic(err)
+				}
+				i := insertResultIntoRows(result)
+				if len(rows[i].columns) == len(namesList) {
+					f, err = rotateDataFile(f)
+					if err != nil {
 						panic(err)
 					}
-					i := insertResultIntoRows(result)
-					if len(rows[i].columns) == len(namesList) {
-						f, err = rotateDataFile(f)
-						if err != nil {
-							panic(err)
-						}
-						renderIndex()
-					}
-				case _ = <-signalChan:
-					f.Sync()
-					f.Close()
-					return
+					renderIndex()
+				}
+			case _ = <-signalChan:
+				f.Sync()
+				f.Close()
+				return
 			}
 		}
 	}()
@@ -391,7 +406,7 @@ func loadFiles() {
 			if secondIdx == firstIdx {
 				continue
 			}
-			name := line[firstIdx+1:secondIdx]
+			name := line[firstIdx+1 : secondIdx]
 			if _, ok := namesSet[name]; !ok {
 				continue
 			}

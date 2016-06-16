@@ -31,7 +31,11 @@
 {{range .Rows}}
 <tr>
 	<td>{{.Time}}</td>
-	{{range .RtList}}<td class="rt-{{if lt . 0}}error{{else if eq . 0}}none{{else if isRtSlow .}}slow{{else}}normal{{end}}">{{if eq . 0}}-{{else if lt . 0}}ERROR{{else}}OK{{end}}</td>{{end}}
+	{{range .RtList}}
+	<td class="rt-{{if lt . 0}}error{{else if eq . 0}}none{{else if isRtSlow .}}slow{{else}}normal{{end}}">
+	{{renderRt .}}
+	</td>
+	{{end}}
 </tr>
 {{end}}
 </table>
