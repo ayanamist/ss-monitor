@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"io"
@@ -286,6 +288,10 @@ func insertResultIntoRows(result benchmarkResult) int {
 func startCheckers() {
 	go func() {
 		var err error
+
+		signalChan := make(chan os.Signal, 1)
+		signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGKILL, syscall.SIGHUP)
+		defer signal.Stop(signalChan)
 		f, err := rotateDataFile(nil)
 		defer func() {
 			if f != nil {
@@ -293,18 +299,24 @@ func startCheckers() {
 			}
 		}()
 		for {
-			result := <-resultChan
-			line := fmt.Sprintf("%d,%s,%d\n", result.startTime.Unix(), result.name, result.rt)
-			if _, err := f.WriteString(line); err != nil {
-				panic(err)
-			}
-			i := insertResultIntoRows(result)
-			if len(rows[i].columns) == len(namesList) {
-				f, err = rotateDataFile(f)
-				if err != nil {
-					panic(err)
-				}
-				renderIndex()
+			select {
+				case result := <-resultChan:
+					line := fmt.Sprintf("%d,%s,%d\n", result.startTime.Unix(), result.name, result.rt)
+					if _, err := f.WriteString(line); err != nil {
+						panic(err)
+					}
+					i := insertResultIntoRows(result)
+					if len(rows[i].columns) == len(namesList) {
+						f, err = rotateDataFile(f)
+						if err != nil {
+							panic(err)
+						}
+						renderIndex()
+					}
+				case _ = <-signalChan:
+					f.Sync()
+					f.Close()
+					return
 			}
 		}
 	}()
