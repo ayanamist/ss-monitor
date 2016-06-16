@@ -35,6 +35,7 @@ type Config struct {
 	OldestHistory int          `yaml:"oldest_history"`
 	SlowThreshold int32        `yaml:"slow_threshold"`
 	ShowRT        bool         `yaml:"show_rt"`
+	CheckURL      string       `yaml:"check_url"`
 	Sites         []SiteConfig `yaml:"sites"`
 }
 
@@ -50,8 +51,8 @@ type dataRow struct {
 }
 
 const (
-	indexFile = "index.htm"
-	checkURL  = "http://connectivitycheck.gstatic.com/generate_204"
+	indexFile       = "index.htm"
+	defaultCheckURL = "http://connectivitycheck.gstatic.com/generate_204"
 )
 
 var (
@@ -120,7 +121,7 @@ func testOne(strURL string) (rt int32, err error) {
 		},
 		ResponseHeaderTimeout: 10 * time.Second,
 	}
-	req, err := http.NewRequest("GET", checkURL, nil)
+	req, err := http.NewRequest("GET", cfg.CheckURL, nil)
 	if err != nil {
 		return -1, err
 	}
@@ -167,6 +168,10 @@ func readConfig() {
 	}
 	if cfg.SlowThreshold <= 0 {
 		cfg.SlowThreshold = 5000
+	}
+	cfg.CheckURL = strings.TrimSpace(cfg.CheckURL)
+	if cfg.CheckURL == "" {
+		cfg.CheckURL = defaultCheckURL
 	}
 	for i := 0; i < len(cfg.Sites); i++ {
 		site := &cfg.Sites[i]
