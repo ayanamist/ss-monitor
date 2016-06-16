@@ -363,22 +363,29 @@ func loadFiles() {
 				}
 				break
 			}
-			splitted := strings.SplitN(string(bytes), ",", 3)
-			if len(splitted) != 3 {
+			line := string(bytes)
+			firstIdx := strings.Index(line, ",")
+			if firstIdx < 0 {
 				continue
 			}
-			timestamp, err := strconv.ParseUint(splitted[0], 10, 0)
+			tsStr := line[:firstIdx]
+			timestamp, err := strconv.ParseUint(tsStr, 10, 0)
 			if err != nil {
-				log.Printf("strconv timestamp %s error: %v", splitted[0], err)
+				log.Printf("strconv timestamp %s error: %v", tsStr, err)
 				continue
 			}
-			name := splitted[1]
+			secondIdx := strings.LastIndex(line, ",")
+			if secondIdx == firstIdx {
+				continue
+			}
+			name := line[firstIdx+1:secondIdx]
 			if _, ok := namesSet[name]; !ok {
 				continue
 			}
-			rt, err := strconv.ParseInt(splitted[2], 10, 0)
+			rtStr := line[secondIdx+1:]
+			rt, err := strconv.ParseInt(rtStr, 10, 0)
 			if err != nil {
-				log.Printf("strconv rt %s error: %v", splitted[2], err)
+				log.Printf("strconv rt %s error: %v", rtStr, err)
 				continue
 			}
 			result := benchmarkResult{name, int32(rt), time.Unix(int64(timestamp), 0)}
