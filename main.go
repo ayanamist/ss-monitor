@@ -204,7 +204,7 @@ func rotateDataFile(oldFile *os.File) (*os.File, error) {
 		}
 		oldFile.Close()
 	}
-	f, err := os.OpenFile(filepath.Join(baseDirPath, newFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(filepath.Join(baseDirPath, newFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY|os.O_SYNC, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +216,7 @@ func rotateDataFile(oldFile *os.File) (*os.File, error) {
 
 func renderIndex() {
 	path := filepath.Join(baseDirPath, indexFile)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_SYNC, 0644)
 	if err != nil {
 		log.Printf("open %s error: %v", path, err)
 		return
