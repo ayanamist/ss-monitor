@@ -315,8 +315,17 @@ func startCheckers() {
 			for _, site := range cfg.Sites {
 				go func(site SiteConfig) {
 					log.Printf("testing %s", site.Name)
-					rt, err := testOne(site.Url)
-					log.Printf("%s rt: %d ms, error: %v", site.Name, rt, err)
+					var err error
+					var rt int32
+					for retry:= 1; retry <= 3; retry++ {
+						rt, err = testOne(site.Url)
+						if err != nil {
+							log.Printf("#%d %s rt: %d ms, error: %v", retry, site.Name, rt, err)
+						} else {
+							log.Printf("#%d %s rt: %d ms", retry, site.Name, rt)
+							break
+						}
+					}
 					resultChan <- benchmarkResult{site.Name, rt, startTime}
 				}(site)
 			}
