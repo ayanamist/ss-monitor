@@ -383,7 +383,7 @@ func loadFiles() {
 		}
 		defer f.Close()
 		reader := bufio.NewReader(f)
-		for len(rows) < cfg.OldestHistory {
+		for {
 			bytes, _, err := reader.ReadLine()
 			if err != nil {
 				if err != io.EOF {
@@ -394,6 +394,7 @@ func loadFiles() {
 			line := string(bytes)
 			firstIdx := strings.Index(line, ",")
 			if firstIdx < 0 {
+				log.Printf("line %s cant find first comma", line)
 				continue
 			}
 			tsStr := line[:firstIdx]
@@ -404,10 +405,12 @@ func loadFiles() {
 			}
 			secondIdx := strings.LastIndex(line, ",")
 			if secondIdx == firstIdx {
+				log.Printf("line %s cant find last comma", line)
 				continue
 			}
 			name := line[firstIdx+1 : secondIdx]
 			if _, ok := namesSet[name]; !ok {
+				log.Printf("name %s not exist in config.yaml", name)
 				continue
 			}
 			rtStr := line[secondIdx+1:]
