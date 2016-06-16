@@ -1,10 +1,15 @@
 <!DOCTYPE html>
 <html>
-<header>
+<head>
 <title>System Status</title>
 <meta charset="UTF-8"/>
 <link rel="stylesheet" type="text/css" href="https://staticfile.qnssl.com/twitter-bootstrap/3.3.6/css/bootstrap.min.css"/>
 <style>
+.generated-time {
+	display: block;
+	width: 100%;
+	text-align: right;
+}
 .rt-normal {
 	background-color: rgba(100,255,100,1);
 }
@@ -15,8 +20,9 @@
 	background-color: rgba(255,100,100,0.8);
 }
 </style>
-</header>
+</head>
 <body>
+<span class="generated-time">Generated: {{.GeneratedTime}}</span>
 <table class="table">
 <tr>
 <th></th>
