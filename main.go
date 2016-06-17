@@ -51,7 +51,7 @@ type dataRow struct {
 }
 
 const (
-	indexFile       = "index.htm"
+	indexFile       = "index.html"
 	defaultCheckURL = "http://connectivitycheck.gstatic.com/generate_204"
 )
 
