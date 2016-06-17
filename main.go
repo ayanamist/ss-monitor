@@ -429,6 +429,10 @@ func startHTTPServer() {
 		}
 		defer f.Close()
 		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		stat, err := f.Stat()
+		if err == nil {
+			w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
+		}
 		io.Copy(w, f)
 	})
 	if !strings.Contains(cfg.HttpPort, ":") {
