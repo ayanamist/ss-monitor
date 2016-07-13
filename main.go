@@ -221,11 +221,25 @@ func rotateDataFile(oldFile *os.File) (*os.File, error) {
 }
 
 func renderIndex() {
-	path := filepath.Join(baseDirPath, indexFile)
+	if err := renderIndexTmp(); err != nil {
+		log.Printf("FATAL: %v", err)
+		return
+	}
+	newpath := filepath.Join(baseDirPath, indexFile)
+	oldpath := newpath + ".tmp"
+	if err := os.Rename(oldpath, newpath); err != nil {
+		log.Printf("FATAL: rotate index file: %v", err)
+		return
+	}
+	log.Print("render index complete")
+}
+
+func renderIndexTmp() (error) {
+	path := filepath.Join(baseDirPath, indexFile + ".tmp")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_SYNC, 0644)
 	if err != nil {
 		log.Printf("open %s error: %v", path, err)
-		return
+		return err
 	}
 	defer f.Close()
 	data := struct {
@@ -272,12 +286,12 @@ func renderIndex() {
 		},
 	}).ParseFiles(filepath.Join(baseDirPath, tplFile))
 	if err != nil {
-		log.Fatalf("template parse: %v", err)
+		return fmt.Errorf("template parse: %v", err)
 	}
 	if err := tpl.Execute(f, data); err != nil {
-		log.Fatalf("template execute: %v", err)
+		return fmt.Errorf("template execute: %v", err)
 	}
-	log.Print("render index complete")
+	return nil
 }
 
 func insertSlices(rows []dataRow, i int, row dataRow) []dataRow {
