@@ -236,7 +236,7 @@ func renderIndex() {
 
 func renderIndexTmp() (error) {
 	path := filepath.Join(baseDirPath, indexFile + ".tmp")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_SYNC, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		log.Printf("open %s error: %v", path, err)
 		return err
