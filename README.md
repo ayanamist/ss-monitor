@@ -7,7 +7,7 @@
 3. 单独创建一个目录，如`BASEDIR=$HOME/ss-monitor; mkdir $BASEDIR`
 4. 改变当面目录 `cd $BASEDIR`
 5. 复制并编辑配置文件 `cp $GOPATH/src/github.com/ayanamist/ss-monitor/config-example.yaml $BASEDIR/config.yaml`
-6. 创建html模板 `ln -s $GOPATH/src/github.com/ayanamist/ss-monitor/index.htm.tpl $BASEDIR/`
+6. 创建html模板 `ln -s $GOPATH/src/github.com/ayanamist/ss-monitor/index.html.tpl $BASEDIR/`
 7. 试启动 `$GOPATH/bin/ss-monitor` 看看有没有报错
 8. 没有报错的话，配置upstart启动脚本`vim /etc/init/ss-monitor.conf`，***请提前将环境变量替换好***<br>
 ```
