@@ -4,7 +4,7 @@
 <title>System Status</title>
 <meta charset="UTF-8"/>
 <meta http-equiv="X-UA-Compatible" content="IE=10; IE=9; IE=8; IE=7; IE=EDGE"/>
-<link rel="stylesheet" type="text/css" href="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/3.3.6/css/bootstrap.min.css"/>
+<link rel="stylesheet" type="text/css" href="https://cdn.bootcss.com/bootstrap/3.3.7/css/bootstrap.min.css"/>
 <style>
 .generated-time {
 	display: block;
@@ -24,11 +24,6 @@
 	background-color: rgba(255,100,100,0.8);
 }
 </style>
-<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jquery/2.2.4/jquery.min.js"></script>
-<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/floatthead/1.4.0/jquery.floatThead.min.js"></script>
-<script type="text/javascript">
-$(function(){$('table.table').floatThead({position: 'fixed'});});
-</script>
 </head>
 <body>
 <span class="generated-time">Generated: {{.GeneratedTime}}</span>
@@ -54,5 +49,10 @@ $(function(){$('table.table').floatThead({position: 'fixed'});});
 {{- end}}
 </tbody>
 </table>
+<script type="text/javascript" src="https://cdn.bootcss.com/jquery/2.2.4/jquery.min.js"></script>
+<script type="text/javascript" src="https://cdn.bootcss.com/floatthead/1.4.5/jquery.floatThead.min.js"></script>
+<script type="text/javascript">
+$(function(){$('table.table').floatThead({position: 'fixed'});});
+</script>
 </body>
 </html>
