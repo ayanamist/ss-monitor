@@ -48,7 +48,13 @@
 <script type="text/javascript" src="https://cdn.bootcss.com/jquery/2.2.4/jquery.min.js"></script>
 <script type="text/javascript" src="https://cdn.bootcss.com/floatthead/1.4.5/jquery.floatThead.min.js"></script>
 <script type="text/javascript">
-$(function(){$('table.table').floatThead({position: 'fixed'});});
+    $(function () {
+        if (window.screen.availWidth >= 1366) {
+            $('table.table').floatThead({
+                position: 'fixed'
+            });
+        }
+    });
 </script>
 </body>
 </html>
