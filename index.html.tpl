@@ -6,31 +6,27 @@
 <meta http-equiv="X-UA-Compatible" content="IE=10; IE=9; IE=8; IE=7; IE=EDGE"/>
 <link rel="stylesheet" type="text/css" href="https://cdn.bootcss.com/bootstrap/3.3.7/css/bootstrap.min.css"/>
 <style>
-.generated-time {
-	display: block;
-	width: 100%;
-	text-align: right;
-}
-.table thead {
-	background-color: white;
-}
-.rt-normal {
-	background-color: rgba(100,255,100,1);
-}
-.rt-slow {
-	background-color: rgba(255,255,100,1);
-}
-.rt-error {
-	background-color: rgba(255,100,100,0.8);
-}
+    .built-time {
+        font-size: xx-small;
+    }
+    .table thead {
+        background-color: white;
+    }
+    .table th:first-child {
+        min-width: 3.4em;
+    }
+    .table th, .table td {
+        text-align: center;
+    }
 </style>
 </head>
 <body>
-<span class="generated-time">Generated: {{.GeneratedTime}}</span>
-<table class="table">
+<table class="table table-bordered table-condensed table-hover">
 <thead>
 <tr>
-	<th></th>
+    <th>
+        <span class="built-time">Built:<br>{{.GeneratedTime}}</span>
+    </th>
 	{{- range .Names }}
 	<th>{{.}}</th>
 	{{- end}}
@@ -41,7 +37,7 @@
 <tr>
 	<td>{{.Time}}</td>
 	{{- range .RtList }}
-	<td class="rt-{{if lt . 0}}error{{else if eq . 0}}none{{else if isRtSlow .}}slow{{else}}normal{{end}}">
+	<td class="{{if lt . 0}}danger{{else if eq . 0}}info{{else if isRtSlow .}}warning{{else}}success{{end}}">
 	{{- renderRt . -}}
 	</td>
 	{{- end}}

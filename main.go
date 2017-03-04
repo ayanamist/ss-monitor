@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -12,14 +14,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
-
-	"io"
-
-	"bufio"
-	"strconv"
 
 	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 	yaml "gopkg.in/yaml.v2"
@@ -28,6 +27,7 @@ import (
 type SiteConfig struct {
 	Name string `yaml:"name"`
 	Url  string `yaml:"url"`
+	hash string
 }
 
 type Config struct {
@@ -40,7 +40,7 @@ type Config struct {
 }
 
 type benchmarkResult struct {
-	name      string
+	hash      string
 	rt        int32
 	startTime time.Time
 }
@@ -55,13 +55,19 @@ const (
 	defaultCheckURL = "http://connectivitycheck.gstatic.com/generate_204"
 )
 
+type empty struct {
+}
+
 var (
-	cfg         = Config{}
-	namesList   = []string{}
-	namesSet    = map[string]bool{}
+	cfg = Config{}
+
+	namesList = []string{}
+	hashSet   = make(map[string]empty)
+
 	baseDirPath string
 	baseDirFile *os.File
-	rows        = []dataRow{}
+
+	rows = []dataRow{}
 )
 
 func makeTimestamp() int64 {
@@ -154,10 +160,10 @@ func readConfig() {
 	}
 	b, err := ioutil.ReadFile(path)
 	if err != nil {
-		panic(err)
+		log.Fatalf("read %s: %v", path, err)
 	}
 	if err := yaml.Unmarshal([]byte(b), &cfg); err != nil {
-		panic(err)
+		log.Fatalf("parse json: %v", err)
 	}
 	cfg.HttpPort = strings.TrimSpace(cfg.HttpPort)
 	if cfg.HttpPort == "" {
@@ -173,21 +179,31 @@ func readConfig() {
 	if cfg.CheckURL == "" {
 		cfg.CheckURL = defaultCheckURL
 	}
+	namesSet := make(map[string]empty)
 	for i := 0; i < len(cfg.Sites); i++ {
 		site := &cfg.Sites[i]
 		site.Name = strings.TrimSpace(site.Name)
 		if site.Name == "" {
-			log.Fatal("name must be specified")
+			log.Fatalf("name must be specified: %#v", site)
 		}
 		if _, ok := namesSet[site.Name]; ok {
-			log.Fatal("name must be unique")
+			log.Fatalf("name %s must be unique", site.Name)
 		}
-		namesSet[site.Name] = true
+		namesSet[site.Name] = empty{}
 		namesList = append(namesList, site.Name)
 		site.Url, err = convertSsURL(strings.TrimSpace(site.Url))
 		if err != nil {
 			log.Fatalf("url: %s error: %v", site.Url, err)
 		}
+		u, err := url.Parse(site.Url)
+		if err != nil {
+			log.Fatalf("invalid url %s: %v", site.Url, err)
+		}
+		site.hash = u.Host
+		if _, ok := hashSet[site.hash]; ok {
+			log.Fatalf("site %s hash must be unique", site.Name)
+		}
+		hashSet[site.hash] = empty{}
 	}
 }
 
@@ -234,8 +250,8 @@ func renderIndex() {
 	log.Print("render index complete")
 }
 
-func renderIndexTmp() (error) {
-	path := filepath.Join(baseDirPath, indexFile + ".tmp")
+func renderIndexTmp() error {
+	path := filepath.Join(baseDirPath, indexFile+".tmp")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		log.Printf("open %s error: %v", path, err)
@@ -251,17 +267,17 @@ func renderIndexTmp() (error) {
 		GeneratedTime string
 	}{}
 	data.Names = namesList
-	data.GeneratedTime = time.Now().Format("2006-01-02 15:04:05")
+	data.GeneratedTime = time.Now().Format("01-02 15:04:05")
 	for _, row := range rows {
 		rts := []int32{}
-		for _, name := range namesList {
-			rt, ok := row.columns[name]
+		for _, site := range cfg.Sites {
+			rt, ok := row.columns[site.hash]
 			if !ok {
 				rt = 0
 			}
 			rts = append(rts, rt)
 		}
-		timestamp := time.Unix(row.timestamp, 0).Format("2006-01-02 15:04")
+		timestamp := time.Unix(row.timestamp, 0).Format("01-02 15:04")
 		data.Rows = append(data.Rows, struct {
 			Time   string
 			RtList []int32
@@ -304,9 +320,9 @@ func insertResultIntoRows(result benchmarkResult) int {
 		return rowTimestamp >= rows[i].timestamp
 	})
 	if len(rows) > 0 && i < len(rows) && rows[i].timestamp == rowTimestamp {
-		rows[i].columns[result.name] = result.rt
+		rows[i].columns[result.hash] = result.rt
 	} else {
-		rows = insertSlices(rows, i, dataRow{rowTimestamp, map[string]int32{result.name: result.rt}})
+		rows = insertSlices(rows, i, dataRow{rowTimestamp, map[string]int32{result.hash: result.rt}})
 		if len(rows) > cfg.OldestHistory {
 			rows = rows[:cfg.OldestHistory]
 			if i >= cfg.OldestHistory {
@@ -328,7 +344,7 @@ func startCheckers() {
 			}
 		}()
 		for result := range resultChan {
-			line := fmt.Sprintf("%d,%s,%d\n", result.startTime.Unix(), result.name, result.rt)
+			line := fmt.Sprintf("%d,%s,%d\n", result.startTime.Unix(), result.hash, result.rt)
 			if _, err := f.WriteString(line); err != nil {
 				panic(err)
 			}
@@ -366,7 +382,7 @@ func startCheckers() {
 							break
 						}
 					}
-					resultChan <- benchmarkResult{site.Name, rt, checkStart}
+					resultChan <- benchmarkResult{site.hash, rt, checkStart}
 				}(site)
 			}
 			time.Sleep(1 * time.Minute)
@@ -388,48 +404,46 @@ func loadFiles() {
 			log.Printf("open %s error: %v", path, err)
 			break
 		}
-		defer f.Close()
-		reader := bufio.NewReader(f)
-		for {
-			bytes, _, err := reader.ReadLine()
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("read %s error: %v", path, err)
+		func() {
+			defer f.Close()
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				line := scanner.Text()
+				firstIdx := strings.Index(line, ",")
+				if firstIdx < 0 {
+					log.Printf("line %s cant find first comma", line)
+					continue
 				}
-				break
+				tsStr := line[:firstIdx]
+				timestamp, err := strconv.ParseUint(tsStr, 10, 0)
+				if err != nil {
+					log.Printf("strconv timestamp %s error: %v", tsStr, err)
+					continue
+				}
+				secondIdx := strings.LastIndex(line, ",")
+				if secondIdx == firstIdx {
+					log.Printf("line %s cant find last comma", line)
+					continue
+				}
+				hash := line[firstIdx+1 : secondIdx]
+				if _, ok := hashSet[hash]; !ok {
+					log.Printf("hash %s not exist in config.yaml", hash)
+					continue
+				}
+				rtStr := line[secondIdx+1:]
+				rt, err := strconv.ParseInt(rtStr, 10, 0)
+				if err != nil {
+					log.Printf("strconv rt %s error: %v", rtStr, err)
+					continue
+				}
+				result := benchmarkResult{hash, int32(rt), time.Unix(int64(timestamp), 0)}
+				insertResultIntoRows(result)
 			}
-			line := string(bytes)
-			firstIdx := strings.Index(line, ",")
-			if firstIdx < 0 {
-				log.Printf("line %s cant find first comma", line)
-				continue
+			if err := scanner.Err(); err != nil {
+				log.Printf("scan %s: %v", f.Name(), err)
 			}
-			tsStr := line[:firstIdx]
-			timestamp, err := strconv.ParseUint(tsStr, 10, 0)
-			if err != nil {
-				log.Printf("strconv timestamp %s error: %v", tsStr, err)
-				continue
-			}
-			secondIdx := strings.LastIndex(line, ",")
-			if secondIdx == firstIdx {
-				log.Printf("line %s cant find last comma", line)
-				continue
-			}
-			name := line[firstIdx+1 : secondIdx]
-			if _, ok := namesSet[name]; !ok {
-				log.Printf("name %s not exist in config.yaml", name)
-				continue
-			}
-			rtStr := line[secondIdx+1:]
-			rt, err := strconv.ParseInt(rtStr, 10, 0)
-			if err != nil {
-				log.Printf("strconv rt %s error: %v", rtStr, err)
-				continue
-			}
-			result := benchmarkResult{name, int32(rt), time.Unix(int64(timestamp), 0)}
-			insertResultIntoRows(result)
-		}
-		now = now.AddDate(0, 0, -1)
+			now = now.AddDate(0, 0, -1)
+		}()
 	}
 }
 
@@ -464,13 +478,15 @@ func startHTTPServer() {
 }
 
 func main() {
+	runtime.GOMAXPROCS(1)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	var err error
 	readConfig()
 	log.Printf("base dir: %s", baseDirPath)
 	log.Printf("oldest history in minutes: %d", cfg.OldestHistory)
 	baseDirFile, err = os.Open(baseDirPath)
 	if err != nil {
-		panic(err)
+		log.Fatalf("open %s: %v", baseDirPath, err)
 	}
 	defer func() {
 		baseDirFile.Sync()
