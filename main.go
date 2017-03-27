@@ -346,13 +346,14 @@ func startCheckers() {
 		for result := range resultChan {
 			line := fmt.Sprintf("%d,%s,%d\n", result.startTime.Unix(), result.hash, result.rt)
 			if _, err := f.WriteString(line); err != nil {
-				panic(err)
+				log.Println(err)
+				continue
 			}
 			i := insertResultIntoRows(result)
 			if len(rows[i].columns) == len(namesList) {
 				f, err = rotateDataFile(f)
 				if err != nil {
-					panic(err)
+					log.Println(err)
 				}
 				renderIndex()
 			}
