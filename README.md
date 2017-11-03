@@ -1,4 +1,4 @@
-用于监控ss服务器状况的小工具。
+用于监控ss/ssr服务器状况的小工具。
 
 # 搭建指南
 
@@ -9,19 +9,38 @@
 5. 复制并编辑配置文件 `cp $GOPATH/src/github.com/ayanamist/ss-monitor/config-example.yaml $BASEDIR/config.yaml`
 6. 创建html模板 `ln -s $GOPATH/src/github.com/ayanamist/ss-monitor/index.html.tpl $BASEDIR/`
 7. 试启动 `$GOPATH/bin/ss-monitor` 看看有没有报错
-8. 没有报错的话，配置upstart启动脚本`vim /etc/init/ss-monitor.conf`，***请提前将环境变量替换好***<br>
-```
-start on runlevel [2345]
-stop on runlevel [!2345]
-
-respawn
-chdir $BASEDIR/ss-monitor
-exec $GOPATH/bin/ss-monitor
-```
-9. 启动upstart job `start ss-monitor`
-10. 提供服务。这里有两种方式提供
+8. 没有报错的话，配置启动脚本，***请提前将环境变量替换好***
+    - upstart: `vim /etc/init/ss-monitor.conf`  
+        ```
+        start on runlevel [2345]
+        stop on runlevel [!2345]
+        
+        respawn
+        chdir $BASEDIR/ss-monitor
+        exec $GOPATH/bin/ss-monitor
+        ```
+    - systemd: `vim /etc/systemd/system/ss-monitor.service`  
+        ```
+        [Unit]
+        After=network.target
+        
+        [Service]
+        Type=simple
+        Restart=always
+        ExecStart=$GOPATH/bin/ss-monitor
+        WorkingDirectory=$BASEDIR/ss-monitor
+        
+        [Install]
+        WantedBy=multi-user.target
+        ```
+        然后 `systemctl daemon-reload`
+9. 安装ssr py版: `git clone https://github.com/shadowsocksrr/shadowsocksr && cd shadowsocksr && python setup.py install && cd -`
+10. 启动
+    - upstart: `start ss-monitor`
+    - systemd: `systemctl start ss-monitor`
+11. 提供服务。这里有两种方式提供
     1. 使用ss-monitor自己的http服务，优点是简单安全，不会泄漏`config.yaml`，nginx配置一个反向代理就可以了
-    2. 使用渲染好的`index.htm`，优点是可以和一些静态文件服务集成，例如Github Pages
+    2. 使用渲染好的`index.html`，优点是可以和一些静态文件服务集成，例如Github Pages
 
 # 说明
 

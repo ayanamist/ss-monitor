@@ -3,7 +3,8 @@ package main
 import (
 	"bufio"
 	"encoding/base64"
-	"errors"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -13,21 +14,24 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
-	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
-	yaml "gopkg.in/yaml.v2"
+	"github.com/pkg/errors"
+	"golang.org/x/net/proxy"
+	"gopkg.in/yaml.v2"
 )
 
 type SiteConfig struct {
 	Name string `yaml:"name"`
 	Url  string `yaml:"url"`
-	hash string
 }
 
 type Config struct {
@@ -52,7 +56,7 @@ type dataRow struct {
 
 const (
 	indexFile       = "index.html"
-	defaultCheckURL = "http://connectivitycheck.gstatic.com/generate_204"
+	defaultCheckURL = "http://www.google.com/generate_204"
 )
 
 type empty struct {
@@ -61,86 +65,215 @@ type empty struct {
 var (
 	cfg = Config{}
 
-	namesList = []string{}
-	hashSet   = make(map[string]empty)
+	servers        []Server
+	serverNames    []string
+	serversHashSet = make(map[string]empty)
 
 	baseDirPath string
 	baseDirFile *os.File
 
-	rows = []dataRow{}
+	rows []dataRow
+
+	globalDialer = &net.Dialer{
+		Timeout: 5 * time.Second,
+	}
+
+	ssrLocalIp = binary.BigEndian.Uint32([]byte(net.ParseIP("127.0.1.0").To4()))
 )
 
-func makeTimestamp() int64 {
-	return time.Now().UnixNano() / int64(time.Millisecond)
+type Server interface {
+	Test() (rt int32, err error)
+	Hash() string
+	Name() string
 }
 
-func convertSsURL(s string) (string, error) {
-	if !strings.Contains(s, "@") {
-		originalURL := s
-		parts := strings.SplitAfterN(s, "//", 2)
-		if len(parts) < 2 {
-			return s, errors.New("invalid url")
-		}
-		decoded, err := base64.StdEncoding.DecodeString(parts[1])
-		if err != nil {
-			return s, err
-		}
-		s = parts[0] + string(decoded)
-		log.Printf("converted %s -> %s", originalURL, s)
-	}
-	return s, nil
+type SsrServer struct {
+	Server        string `json:"server"`
+	ServerPort    int    `json:"server_port"`
+	Method        string `json:"method"`
+	Password      string `json:"password"`
+	Protocol      string `json:"protocol"`
+	ProtocolParam string `json:"protocol_param"`
+	Obfs          string `json:"obfs"`
+	ObfsParam     string `json:"obfs_param"`
+	LocalAddr     string `json:"local_address"`
+	LocalPort     int    `json:"local_port"`
+
+	name string `json:"-"`
+	hash string `json:"-"`
 }
 
-func testOne(strURL string) (rt int32, err error) {
-	ssURL, err := url.Parse(strURL)
+func (s *SsrServer) Test() (rt int32, err error) {
+	l, err := net.Listen("tcp", s.LocalAddr+":0")
 	if err != nil {
-		return -1, err
+		return 0, errors.Wrap(err, "try local port")
 	}
-	method := ssURL.User.Username()
-	password, ok := ssURL.User.Password()
-	if !ok {
-		return -1, errors.New("no password")
-	}
-	cipher, err := ss.NewCipher(method, password)
+	_, portStr, _ := net.SplitHostPort(l.Addr().String())
+	l.Close()
+
+	s.LocalPort, _ = strconv.Atoi(portStr)
+	addr := fmt.Sprintf("%s:%d", s.LocalAddr, s.LocalPort)
+
+	confBytes, _ := json.Marshal(s)
+	f, err := ioutil.TempFile("", "ssr_config")
 	if err != nil {
-		return -1, err
+		return 0, errors.Wrap(err, "open temp file")
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if _, err := f.Write(confBytes); err != nil {
+		return 0, errors.Wrap(err, "write temp file")
 	}
 
-	conn, err := net.DialTimeout("tcp", ssURL.Host, 5*time.Second)
+	cmd := exec.Command("sslocal", "-c", f.Name())
+	stdoutPr, err := cmd.StdoutPipe()
 	if err != nil {
-		return -1, err
+		return 0, errors.Wrap(err, "cmd.StdoutPipe")
 	}
-	defer conn.Close()
-	c := ss.NewConn(conn, cipher)
+	cmd.Stderr = cmd.Stdout
+	if err := cmd.Start(); err != nil {
+		return 0, errors.Wrap(err, "start sslocal")
+	}
+	defer cmd.Process.Kill()
 
+	go func() {
+		scanner := bufio.NewScanner(stdoutPr)
+		for scanner.Scan() {
+			log.Printf("%s:%d stdout: %s", s.Server, s.ServerPort, scanner.Text())
+		}
+	}()
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			if eer, ok := err.(*exec.ExitError); ok {
+				if status, ok := eer.Sys().(syscall.WaitStatus); ok {
+					if status.Signaled() {
+						switch status.Signal() {
+						case syscall.SIGKILL, syscall.SIGTERM, syscall.SIGINT:
+							return
+						}
+					}
+				}
+			}
+			log.Printf("%s exit: %v", s.Hash(), err)
+		}
+	}()
+
+	var isListening bool
+	for i := 0; i < 50; i++ {
+		c, err := globalDialer.Dial("tcp4", addr)
+		if err == nil {
+			c.Close()
+			isListening = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !isListening {
+		return -1, errors.Errorf("%s not listening %s", s.Hash(), addr)
+	}
+
+	dialer, _ := proxy.SOCKS5("tcp4", addr, nil, globalDialer)
 	tr := &http.Transport{
-		Dial: func(network, addr string) (net.Conn, error) {
-			rawAddr, err := ss.RawAddr(addr)
-			if err != nil {
-				return nil, err
-			}
-			if _, err = c.Write(rawAddr); err != nil {
-				c.Close()
-				return nil, err
-			}
-			return c, nil
-		},
+		Dial: dialer.Dial,
 		ResponseHeaderTimeout: 10 * time.Second,
 	}
 	req, err := http.NewRequest("GET", cfg.CheckURL, nil)
 	if err != nil {
-		return -1, err
+		return -1, errors.Wrap(err, "new http request")
 	}
-	startTime := makeTimestamp()
+	startTime := time.Now()
 	resp, err := tr.RoundTrip(req)
-	rt = int32(makeTimestamp() - startTime)
+	rt = int32(time.Now().Sub(startTime) / time.Millisecond)
 	if err != nil {
-		return rt, err
+		return rt, errors.Wrapf(err, "roundtrip")
 	}
 	if resp.StatusCode != 204 {
-		return rt, fmt.Errorf("return %d %s but not 204", resp.StatusCode, resp.Status)
+		return -1, fmt.Errorf("resp status %d %s not 204", resp.StatusCode, resp.Status)
 	}
 	return rt, nil
+}
+
+func (s *SsrServer) Hash() string {
+	return s.hash
+}
+
+func (s *SsrServer) Name() string {
+	return s.name
+}
+
+func newServerFromURL(name, rawurl string) (Server, error) {
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		return nil, errors.Wrap(err, "parse url "+rawurl)
+	}
+	s := &SsrServer{}
+	switch u.Scheme {
+	case "ss":
+		host, portStr, err := net.SplitHostPort(u.Host)
+		if err != nil {
+			return nil, errors.Wrap(err, "split host port "+u.Host)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, errors.Wrap(err, "port invalid "+portStr)
+		}
+		s.Server = host
+		s.ServerPort = port
+		if u.User == nil {
+			return nil, errors.Errorf("empty method password")
+		}
+		s.Method = u.User.Username()
+		s.Password, _ = u.User.Password()
+		s.Obfs = "plain"
+		s.Protocol = "origin"
+	case "ssr":
+		splitted := strings.Split(u.Host, ":")
+		if len(splitted) != 6 {
+			return nil, errors.Errorf("invalid ssr host")
+		}
+		s.Server = splitted[0]
+		s.ServerPort, err = strconv.Atoi(splitted[1])
+		if err != nil {
+			return nil, errors.Wrap(err, "port invalid "+splitted[1])
+		}
+		s.Protocol = splitted[2]
+		s.Method = splitted[3]
+		s.Obfs = splitted[4]
+		s.Password, err = b64SafeDecode(splitted[5])
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid base64pass: %s", splitted[5])
+		}
+		s.ObfsParam, _ = b64SafeDecode(u.Query().Get("obfsparam"))
+		s.ProtocolParam, _ = b64SafeDecode(u.Query().Get("protoparam"))
+	default:
+		return nil, errors.Errorf("unsupported scheme %s: %s", u.Scheme, rawurl)
+	}
+	s.name = name
+	s.hash = fmt.Sprintf("%s:%d", s.Server, s.ServerPort)
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, atomic.AddUint32(&ssrLocalIp, 1))
+	s.LocalAddr = net.IP(buf).String()
+	return s, nil
+}
+
+func convertBase64URL(s string) string {
+	originalURL := s
+	parts := strings.SplitAfterN(s, "//", 2)
+	if len(parts) < 2 {
+		return s
+	}
+	decoded, err := b64SafeDecode(parts[1])
+	if err != nil {
+		return s
+	}
+	s = parts[0] + decoded
+	log.Printf("converted %s -> %s", originalURL, s)
+	return s
+}
+
+func b64SafeDecode(s string) (string, error) {
+	b, err := base64.RawURLEncoding.DecodeString(s)
+	return string(b), err
 }
 
 func readConfig() {
@@ -190,20 +323,18 @@ func readConfig() {
 			log.Fatalf("name %s must be unique", site.Name)
 		}
 		namesSet[site.Name] = empty{}
-		namesList = append(namesList, site.Name)
-		site.Url, err = convertSsURL(strings.TrimSpace(site.Url))
+		urlStr := convertBase64URL(strings.TrimSpace(site.Url))
+		server, err := newServerFromURL(site.Name, urlStr)
 		if err != nil {
-			log.Fatalf("url: %s error: %v", site.Url, err)
+			log.Fatalf("new server error %s: %v", urlStr, err)
 		}
-		u, err := url.Parse(site.Url)
-		if err != nil {
-			log.Fatalf("invalid url %s: %v", site.Url, err)
-		}
-		site.hash = u.Host
-		if _, ok := hashSet[site.hash]; ok {
+		hash := server.Hash()
+		if _, ok := serversHashSet[hash]; ok {
 			log.Fatalf("site %s hash must be unique", site.Name)
 		}
-		hashSet[site.hash] = empty{}
+		serversHashSet[hash] = empty{}
+		servers = append(servers, server)
+		serverNames = append(serverNames, site.Name)
 	}
 }
 
@@ -266,12 +397,12 @@ func renderIndexTmp() error {
 		}
 		GeneratedTime string
 	}{}
-	data.Names = namesList
+	data.Names = serverNames
 	data.GeneratedTime = time.Now().Format("01-02 15:04:05")
 	for _, row := range rows {
-		rts := []int32{}
-		for _, site := range cfg.Sites {
-			rt, ok := row.columns[site.hash]
+		var rts []int32
+		for _, server := range servers {
+			rt, ok := row.columns[server.Hash()]
 			if !ok {
 				rt = 0
 			}
@@ -350,7 +481,7 @@ func startCheckers() {
 				continue
 			}
 			i := insertResultIntoRows(result)
-			if len(rows[i].columns) == len(namesList) {
+			if len(rows[i].columns) == len(serverNames) {
 				f, err = rotateDataFile(f)
 				if err != nil {
 					log.Println(err)
@@ -363,28 +494,28 @@ func startCheckers() {
 	go func() {
 		for {
 			checkStart := time.Now()
-			for _, site := range cfg.Sites {
-				go func(site SiteConfig) {
-					log.Printf("testing %s", site.Name)
+			for _, server := range servers {
+				go func(server Server) {
+					log.Printf("testing %s", server.Hash())
 					var err error
 					var rt int32
 					for retry := 1; retry <= 3; retry++ {
 						retryStart := time.Now().Unix()
-						rt, err = testOne(site.Url)
+						rt, err = server.Test()
 						if err != nil {
 							remain := time.Duration(15 - (time.Now().Unix() - retryStart))
-							log.Printf("#%d %s rt: %d ms, error: %v, sleep %ds", retry, site.Name, rt, err, remain)
+							log.Printf("#%d %s rt: %d ms, error: %v, sleep %ds", retry, server.Hash(), rt, err, remain)
 							rt = -1
 							if remain > 0 {
 								time.Sleep(remain * time.Second)
 							}
 						} else {
-							log.Printf("#%d %s rt: %d ms", retry, site.Name, rt)
+							log.Printf("#%d %s rt: %d ms", retry, server.Hash(), rt)
 							break
 						}
 					}
-					resultChan <- benchmarkResult{site.hash, rt, checkStart}
-				}(site)
+					resultChan <- benchmarkResult{server.Hash(), rt, checkStart}
+				}(server)
 			}
 			time.Sleep(1 * time.Minute)
 		}
@@ -427,7 +558,7 @@ func loadFiles() {
 					continue
 				}
 				hash := line[firstIdx+1 : secondIdx]
-				if _, ok := hashSet[hash]; !ok {
+				if _, ok := serversHashSet[hash]; !ok {
 					log.Printf("hash %s not exist in config.yaml", hash)
 					continue
 				}
