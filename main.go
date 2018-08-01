@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -101,40 +102,60 @@ type SsrServer struct {
 
 	name string `json:"-"`
 	hash string `json:"-"`
+
+	cmd *exec.Cmd `json:"-"`
 }
 
-func (s *SsrServer) Test() (rt int32, err error) {
+func (s *SsrServer) restartProcess() error {
+	if s.cmd != nil {
+		s.cmd.Process.Kill()
+		if err := s.cmd.Wait(); err != nil {
+			if eer, ok := err.(*exec.ExitError); ok {
+				if status, ok := eer.Sys().(syscall.WaitStatus); ok {
+					if status.Signaled() {
+						switch status.Signal() {
+						case syscall.SIGKILL, syscall.SIGTERM, syscall.SIGINT:
+							err = nil
+						}
+					}
+				}
+			}
+			if err != nil {
+				log.Printf("%s exit: %v", s.Hash(), err)
+			}
+		}
+		s.cmd = nil
+	}
+
 	l, err := net.Listen("tcp", s.LocalAddr+":0")
 	if err != nil {
-		return 0, errors.Wrap(err, "try local port")
+		return errors.Wrap(err, "try local port")
 	}
 	_, portStr, _ := net.SplitHostPort(l.Addr().String())
 	l.Close()
 
 	s.LocalPort, _ = strconv.Atoi(portStr)
-	addr := fmt.Sprintf("%s:%d", s.LocalAddr, s.LocalPort)
 
 	confBytes, _ := json.Marshal(s)
 	f, err := ioutil.TempFile("", "ssr_config")
 	if err != nil {
-		return 0, errors.Wrap(err, "open temp file")
+		return errors.Wrap(err, "open temp file")
 	}
 	defer os.Remove(f.Name())
 	defer f.Close()
 	if _, err := f.Write(confBytes); err != nil {
-		return 0, errors.Wrap(err, "write temp file")
+		return errors.Wrap(err, "write temp file")
 	}
 
 	cmd := exec.Command("sslocal", "-c", f.Name())
 	stdoutPr, err := cmd.StdoutPipe()
 	if err != nil {
-		return 0, errors.Wrap(err, "cmd.StdoutPipe")
+		return errors.Wrap(err, "cmd.StdoutPipe")
 	}
 	cmd.Stderr = cmd.Stdout
 	if err := cmd.Start(); err != nil {
-		return 0, errors.Wrap(err, "start sslocal")
+		return errors.Wrap(err, "start sslocal")
 	}
-	defer cmd.Process.Kill()
 
 	go func() {
 		scanner := bufio.NewScanner(stdoutPr)
@@ -142,21 +163,8 @@ func (s *SsrServer) Test() (rt int32, err error) {
 			log.Printf("%s:%d stdout: %s", s.Server, s.ServerPort, scanner.Text())
 		}
 	}()
-	go func() {
-		if err := cmd.Wait(); err != nil {
-			if eer, ok := err.(*exec.ExitError); ok {
-				if status, ok := eer.Sys().(syscall.WaitStatus); ok {
-					if status.Signaled() {
-						switch status.Signal() {
-						case syscall.SIGKILL, syscall.SIGTERM, syscall.SIGINT:
-							return
-						}
-					}
-				}
-			}
-			log.Printf("%s exit: %v", s.Hash(), err)
-		}
-	}()
+
+	addr := fmt.Sprintf("%s:%d", s.LocalAddr, s.LocalPort)
 
 	var isListening bool
 	for i := 0; i < 50; i++ {
@@ -169,12 +177,18 @@ func (s *SsrServer) Test() (rt int32, err error) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if !isListening {
-		return -1, errors.Errorf("%s not listening %s", s.Hash(), addr)
+		return errors.Errorf("%s not listening %s", s.Hash(), addr)
 	}
+	s.cmd = cmd
+	return nil
+}
 
-	dialer, _ := proxy.SOCKS5("tcp4", addr, nil, globalDialer)
+func (s *SsrServer) Test() (rt int32, err error) {
+	dialer, _ := proxy.SOCKS5("tcp4", fmt.Sprintf("%s:%d", s.LocalAddr, s.LocalPort), nil, globalDialer)
 	tr := &http.Transport{
-		Dial: dialer.Dial,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		},
 		ResponseHeaderTimeout: 10 * time.Second,
 	}
 	req, err := http.NewRequest("GET", cfg.CheckURL, nil)
@@ -184,11 +198,17 @@ func (s *SsrServer) Test() (rt int32, err error) {
 	startTime := time.Now()
 	resp, err := tr.RoundTrip(req)
 	rt = int32(time.Now().Sub(startTime) / time.Millisecond)
-	if err != nil {
-		return rt, errors.Wrapf(err, "roundtrip")
+	if resp != nil {
+		io.Copy(ioutil.Discard, resp.Body)
+		resp.Body.Close()
 	}
-	if resp.StatusCode != 204 {
-		return -1, fmt.Errorf("resp status %d %s not 204", resp.StatusCode, resp.Status)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "connection refused") {
+			if err := s.restartProcess(); err != nil {
+				log.Printf("%s restartProcess: %v", s.Hash(), err)
+			}
+		}
+		return rt, errors.Wrapf(err, "roundtrip")
 	}
 	return rt, nil
 }
