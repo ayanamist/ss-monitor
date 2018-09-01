@@ -292,7 +292,13 @@ func convertBase64URL(s string) string {
 }
 
 func b64SafeDecode(s string) (string, error) {
-	b, err := base64.RawURLEncoding.DecodeString(s)
+	var decodeFunc func(s string) ([]byte, error)
+	if s[len(s)-1] == '=' {
+		decodeFunc = base64.URLEncoding.DecodeString
+	} else {
+		decodeFunc = base64.RawURLEncoding.DecodeString
+	}
+	b, err := decodeFunc(s)
 	return string(b), err
 }
 
