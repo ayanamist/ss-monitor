@@ -4,7 +4,7 @@
 <title>System Status</title>
 <meta charset="UTF-8"/>
 <meta http-equiv="X-UA-Compatible" content="IE=10; IE=9; IE=8; IE=7; IE=EDGE"/>
-<link rel="stylesheet" type="text/css" href="https://cdn.bootcss.com/bootstrap/3.3.7/css/bootstrap.min.css"/>
+<link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/bootstrap@3.3.7/dist/css/bootstrap.min.css"/>
 <style>
     .built-time {
         font-size: xx-small;
@@ -45,8 +45,8 @@
 {{- end}}
 </tbody>
 </table>
-<script type="text/javascript" src="https://cdn.bootcss.com/jquery/2.2.4/jquery.min.js"></script>
-<script type="text/javascript" src="https://cdn.bootcss.com/floatthead/1.4.5/jquery.floatThead.min.js"></script>
+<script type="text/javascript" src="https://cdn.jsdelivr.net/npm/jquery@2.2.4/dist/jquery.min.js"></script>
+<script type="text/javascript" src="https://cdn.jsdelivr.net/npm/floatthead@2.1.2/dist/jquery.floatThead.min.js"></script>
 <script type="text/javascript">
 $(function(){$('table.table').floatThead({position: 'fixed'});});
 </script>
