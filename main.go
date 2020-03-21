@@ -587,18 +587,21 @@ func startCheckers() {
 					var err error
 					var rt int32
 					interval := time.NewTicker(15 * time.Second)
-					for retry := 1; retry <= 3; retry++ {
+					for retry := 1; ; retry++ {
 						rt, err = serverConfig.server.Test()
 						if err != nil {
 							log.Printf("group=%s server=%s retry#%d rt: %d ms, error: %v",
 								groupName, serverHash, retry, rt, err)
 							rt = -1
-							<-interval.C
 						} else {
 							log.Printf("group=%s server=%s retry#%d rt: %d ms",
 								groupName, serverHash, retry, rt)
 							break
 						}
+						if retry >= 3 {
+							break
+						}
+						<-interval.C
 					}
 					interval.Stop()
 					resultChan <- benchmarkResult{serverHash, rt, checkStart}
