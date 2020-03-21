@@ -2,7 +2,15 @@ http_port: 127.0.0.1:0
 oldest_history: 60
 slow_threshold: 5000
 sites:
-- name: server1
-  url: ss://method:password@host1:port
-- name: server2
-  url: ss://method:password@host2:port
+  - name: group1
+    servers:
+      - name: server1
+        url: ss://method:password@host1:port
+      - name: server2
+        url: ss://method:password@host2:port
+  - name: group2
+    servers:
+      - name: server3
+        url: ss://method:password@host1:port
+      - name: server4
+        url: ss://method:password@host2:port

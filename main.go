@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"container/list"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -18,7 +19,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -30,9 +30,17 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-type SiteConfig struct {
-	Name string `yaml:"name"`
-	Url  string `yaml:"url"`
+type SiteGroup struct {
+	Name    string          `yaml:"name"`
+	Servers []*ServerConfig `yaml:"servers"`
+}
+
+type ServerConfig struct {
+	Name    string `yaml:"name"`
+	Url     string `yaml:"url"`
+	server  Server
+	group   *SiteGroup
+	results []benchmarkResult
 }
 
 type Config struct {
@@ -41,7 +49,7 @@ type Config struct {
 	SlowThreshold int32        `yaml:"slow_threshold"`
 	ShowRT        bool         `yaml:"show_rt"`
 	CheckURL      string       `yaml:"check_url"`
-	Sites         []SiteConfig `yaml:"sites"`
+	SiteGroups    []*SiteGroup `yaml:"groups"`
 }
 
 type benchmarkResult struct {
@@ -52,7 +60,7 @@ type benchmarkResult struct {
 
 type dataRow struct {
 	timestamp int64
-	columns   map[string]int32
+	columns   map[string]int32 // map[serverHash]rt
 }
 
 const (
@@ -64,16 +72,14 @@ type empty struct {
 }
 
 var (
-	cfg = Config{}
+	globalConfig = &Config{}
 
-	servers        []Server
-	serverNames    []string
-	serversHashSet = make(map[string]empty)
+	serversByHash = make(map[string]*ServerConfig)
 
 	baseDirPath string
 	baseDirFile *os.File
 
-	rows []dataRow
+	globalDataRows = list.New()
 
 	globalDialer = &net.Dialer{
 		Timeout: 5 * time.Second,
@@ -191,7 +197,7 @@ func (s *SsrServer) Test() (rt int32, err error) {
 		},
 		ResponseHeaderTimeout: 10 * time.Second,
 	}
-	req, err := http.NewRequest("GET", cfg.CheckURL, nil)
+	req, err := http.NewRequest("GET", globalConfig.CheckURL, nil)
 	if err != nil {
 		return -1, errors.Wrap(err, "new http request")
 	}
@@ -221,14 +227,13 @@ func (s *SsrServer) Name() string {
 	return s.name
 }
 
-func newServerFromURL(name, rawurl string) (Server, error) {
-	u, err := url.Parse(rawurl)
-	if err != nil {
-		return nil, errors.Wrap(err, "parse url "+rawurl)
-	}
+func newServerFromURL(name, rawurl string) (_ Server, err error) {
 	s := &SsrServer{}
-	switch u.Scheme {
-	case "ss":
+	if strings.HasPrefix(rawurl, "ss://") {
+		u, err := url.Parse(rawurl)
+		if err != nil {
+			return nil, err
+		}
 		host, portStr, err := net.SplitHostPort(u.Host)
 		if err != nil {
 			return nil, errors.Wrap(err, "split host port "+u.Host)
@@ -246,8 +251,14 @@ func newServerFromURL(name, rawurl string) (Server, error) {
 		s.Password, _ = u.User.Password()
 		s.Obfs = "plain"
 		s.Protocol = "origin"
-	case "ssr":
-		splitted := strings.Split(u.Host, ":")
+	} else if strings.HasPrefix(rawurl, "ssr://") {
+		parts := strings.SplitN(rawurl, "/", 4)
+		if len(parts) < 3 {
+			return nil, errors.Errorf("invalid ssr url %s", rawurl)
+		} else if len(parts) == 3 {
+			parts = append(parts, "")
+		}
+		splitted := strings.Split(parts[2], ":")
 		if len(splitted) != 6 {
 			return nil, errors.Errorf("invalid ssr host")
 		}
@@ -263,10 +274,14 @@ func newServerFromURL(name, rawurl string) (Server, error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "invalid base64pass: %s", splitted[5])
 		}
-		s.ObfsParam, _ = b64SafeDecode(u.Query().Get("obfsparam"))
-		s.ProtocolParam, _ = b64SafeDecode(u.Query().Get("protoparam"))
-	default:
-		return nil, errors.Errorf("unsupported scheme %s: %s", u.Scheme, rawurl)
+		query, err := url.ParseQuery(strings.TrimLeft(parts[3], "?"))
+		if err != nil {
+			return nil, err
+		}
+		s.ObfsParam, _ = b64SafeDecode(query.Get("obfsparam"))
+		s.ProtocolParam, _ = b64SafeDecode(query.Get("protoparam"))
+	} else {
+		return nil, errors.Errorf("unsupported scheme %s", rawurl)
 	}
 	s.name = name
 	s.hash = fmt.Sprintf("%s:%d", s.Server, s.ServerPort)
@@ -321,46 +336,54 @@ func readConfig() {
 	if err != nil {
 		log.Fatalf("read %s: %v", path, err)
 	}
-	if err := yaml.Unmarshal(b, &cfg); err != nil {
+	if err := yaml.Unmarshal(b, &globalConfig); err != nil {
 		log.Fatalf("parse json: %v", err)
 	}
-	cfg.HttpPort = strings.TrimSpace(cfg.HttpPort)
-	if cfg.HttpPort == "" {
+	globalConfig.HttpPort = strings.TrimSpace(globalConfig.HttpPort)
+	if globalConfig.HttpPort == "" {
 		log.Fatal("http_port must be specified")
 	}
-	if cfg.OldestHistory <= 0 {
-		cfg.OldestHistory = 60
+	if globalConfig.OldestHistory <= 0 {
+		globalConfig.OldestHistory = 60
 	}
-	if cfg.SlowThreshold <= 0 {
-		cfg.SlowThreshold = 5000
+	if globalConfig.SlowThreshold <= 0 {
+		globalConfig.SlowThreshold = 5000
 	}
-	cfg.CheckURL = strings.TrimSpace(cfg.CheckURL)
-	if cfg.CheckURL == "" {
-		cfg.CheckURL = defaultCheckURL
+	globalConfig.CheckURL = strings.TrimSpace(globalConfig.CheckURL)
+	if globalConfig.CheckURL == "" {
+		globalConfig.CheckURL = defaultCheckURL
 	}
-	namesSet := make(map[string]empty)
-	for i := 0; i < len(cfg.Sites); i++ {
-		site := &cfg.Sites[i]
-		site.Name = strings.TrimSpace(site.Name)
-		if site.Name == "" {
-			log.Fatalf("name must be specified: %#v", site)
+	for _, group := range globalConfig.SiteGroups {
+		group.Name = strings.TrimSpace(group.Name)
+		if group.Name == "" {
+			log.Fatalf("group name must be specified: %#v", group)
 		}
-		if _, ok := namesSet[site.Name]; ok {
-			log.Fatalf("name %s must be unique", site.Name)
+		for _, serverConfig := range group.Servers {
+			namesSet := make(map[string]empty)
+			serverConfig.Name = strings.TrimSpace(serverConfig.Name)
+			if serverConfig.Name == "" {
+				log.Fatalf("server name must be specified: %#v", serverConfig)
+			}
+			if _, ok := namesSet[serverConfig.Name]; ok {
+				log.Fatalf("server name %s must be group unique", serverConfig.Name)
+			}
+			namesSet[serverConfig.Name] = empty{}
+			urlStr := convertBase64URL(strings.TrimSpace(serverConfig.Url))
+			server, err := newServerFromURL(serverConfig.Name, urlStr)
+			if err != nil {
+				log.Fatalf("new serverConfig error %s: %v", urlStr, err)
+			}
+			hash := server.Hash()
+			if _, ok := serversByHash[hash]; ok {
+				log.Fatalf("server %s hash must be global unique", serverConfig.Name)
+			}
+			tmpConfig := serverConfig
+			tmpConfig.server = server
+			tmpConfig.group = &SiteGroup{
+				Name: group.Name,
+			}
+			serversByHash[hash] = tmpConfig
 		}
-		namesSet[site.Name] = empty{}
-		urlStr := convertBase64URL(strings.TrimSpace(site.Url))
-		server, err := newServerFromURL(site.Name, urlStr)
-		if err != nil {
-			log.Fatalf("new server error %s: %v", urlStr, err)
-		}
-		hash := server.Hash()
-		if _, ok := serversHashSet[hash]; ok {
-			log.Fatalf("site %s hash must be unique", site.Name)
-		}
-		serversHashSet[hash] = empty{}
-		servers = append(servers, server)
-		serverNames = append(serverNames, site.Name)
 	}
 }
 
@@ -374,22 +397,23 @@ func dataFileName(t time.Time) string {
 	return fmt.Sprintf("data.%s.csv", t.Format("2006-01-02"))
 }
 
-func rotateDataFile(oldFile *os.File) (*os.File, error) {
+func rotateDataFile(oldFile *os.File) *os.File {
 	newFileName := dataFileName(time.Now())
 	if oldFile != nil {
-		_ = oldFile.Sync()
 		if filepath.Base(oldFile.Name()) == newFileName {
-			return oldFile, nil
+			return oldFile
 		}
+		_ = oldFile.Sync()
 		oldFile.Close()
 	}
-	f, err := os.OpenFile(filepath.Join(baseDirPath, newFileName), os.O_CREATE|os.O_APPEND|os.O_WRONLY|os.O_SYNC, 0600)
+	newPath := filepath.Join(baseDirPath, newFileName)
+	f, err := os.OpenFile(newPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
-		return nil, err
+		log.Fatalf("rotateDataFile to %s error: %s", newPath, err)
 	}
 	log.Printf("rotate to %s", newFileName)
 	_ = baseDirFile.Sync()
-	return f, nil
+	return f
 
 }
 
@@ -416,40 +440,59 @@ func renderIndexTmp() error {
 	}
 	defer f.Close()
 	data := struct {
-		Names []string
-		Rows  []struct {
-			Time   string
-			RtList []int32
+		Groups []struct {
+			Name        string
+			ServerNames []string
+			Rows        []struct {
+				Time   string
+				RtList []int32
+			}
 		}
 		GeneratedTime string
 	}{}
-	data.Names = serverNames
 	data.GeneratedTime = time.Now().Format("01-02 15:04:05")
-	for _, row := range rows {
-		var rts []int32
-		for _, server := range servers {
-			rt, ok := row.columns[server.Hash()]
-			if !ok {
-				rt = 0
-			}
-			rts = append(rts, rt)
+	for _, group := range globalConfig.SiteGroups {
+		serverNames := make([]string, len(group.Servers))
+		for i, v := range group.Servers {
+			serverNames[i] = v.Name
 		}
+		data.Groups = append(data.Groups, struct {
+			Name        string
+			ServerNames []string
+			Rows        []struct {
+				Time   string
+				RtList []int32
+			}
+		}{
+			Name:        group.Name,
+			ServerNames: serverNames,
+		})
+	}
+	for e := globalDataRows.Front(); e != nil; e = e.Next() {
+		row := e.Value.(*dataRow)
 		timestamp := time.Unix(row.timestamp, 0).Format("01-02 15:04")
-		data.Rows = append(data.Rows, struct {
-			Time   string
-			RtList []int32
-		}{timestamp, rts})
+		for i, group := range globalConfig.SiteGroups {
+			rts := make([]int32, len(group.Servers))
+			for j, serverConfig := range group.Servers {
+				rt := row.columns[serverConfig.server.Hash()]
+				rts[j] = rt
+			}
+			data.Groups[i].Rows = append(data.Groups[i].Rows, struct {
+				Time   string
+				RtList []int32
+			}{Time: timestamp, RtList: rts})
+		}
 	}
 	tplFile := indexFile + ".tpl"
 	tpl, err := template.New(tplFile).Funcs(map[string]interface{}{
 		"isRtSlow": func(rt int32) bool {
-			return rt >= cfg.SlowThreshold
+			return rt >= globalConfig.SlowThreshold
 		},
 		"renderRt": func(rt int32) string {
 			if rt == 0 {
 				return "-"
 			}
-			if cfg.ShowRT {
+			if globalConfig.ShowRT {
 				return strconv.FormatInt(int64(rt), 10)
 			}
 			if rt < 0 {
@@ -467,91 +510,107 @@ func renderIndexTmp() error {
 	return nil
 }
 
-func insertSlices(rows []dataRow, i int, row dataRow) []dataRow {
-	return append(rows[:i], append([]dataRow{row}, rows[i:]...)...)
-}
+func insertResultIntoRows(result benchmarkResult) (curRowComplete bool) {
+	if _, ok := serversByHash[result.hash]; !ok {
+		log.Printf("unknown hash and discard: %#v", result)
+		return false
+	}
 
-func insertResultIntoRows(result benchmarkResult) int {
 	rowTimestamp := dropTimeSecond(result.startTime).Unix()
-	i := sort.Search(len(rows), func(i int) bool {
-		return rowTimestamp >= rows[i].timestamp
-	})
-	if len(rows) > 0 && i < len(rows) && rows[i].timestamp == rowTimestamp {
-		rows[i].columns[result.hash] = result.rt
+	var row *dataRow
+	if globalDataRows.Front() == nil {
+		row = &dataRow{
+			timestamp: rowTimestamp,
+			columns:   make(map[string]int32),
+		}
+		globalDataRows.PushFront(row)
 	} else {
-		rows = insertSlices(rows, i, dataRow{rowTimestamp, map[string]int32{result.hash: result.rt}})
-		if len(rows) > cfg.OldestHistory {
-			rows = rows[:cfg.OldestHistory]
-			if i >= cfg.OldestHistory {
-				i = cfg.OldestHistory - 1
+		for e := globalDataRows.Front(); e != nil; e = e.Next() {
+			tmpRow := e.Value.(*dataRow)
+			if tmpRow.timestamp < rowTimestamp {
+				row = &dataRow{
+					timestamp: rowTimestamp,
+					columns:   make(map[string]int32),
+				}
+				globalDataRows.PushFront(row)
+				break
+			} else if tmpRow.timestamp == rowTimestamp {
+				row = tmpRow
+				break
 			}
 		}
+		if row == nil {
+			log.Printf("WARN too old data and discard: %#v", result)
+			return false
+		}
 	}
-	return i
+	row.columns[result.hash] = result.rt
+	if len(row.columns) < len(serversByHash) {
+		return false
+	}
+	for globalDataRows.Len() >= globalConfig.OldestHistory {
+		if e := globalDataRows.Back(); e != nil {
+			globalDataRows.Remove(e)
+		} else {
+			break
+		}
+	}
+	return true
 }
 
 func startCheckers() {
 	go func() {
-		var err error
-
-		f, err := rotateDataFile(nil)
-		defer func() {
-			if f != nil {
-				f.Close()
-			}
-		}()
+		f := rotateDataFile(nil)
+		defer f.Close()
 		for result := range resultChan {
 			line := fmt.Sprintf("%d,%s,%d\n", result.startTime.Unix(), result.hash, result.rt)
 			if _, err := f.WriteString(line); err != nil {
 				log.Println(err)
 				continue
 			}
-			i := insertResultIntoRows(result)
-			if len(rows[i].columns) == len(serverNames) {
-				f, err = rotateDataFile(f)
-				if err != nil {
-					log.Println(err)
-				}
+			if insertResultIntoRows(result) {
+				f = rotateDataFile(f)
 				renderIndex()
 			}
 		}
 	}()
 
 	go func() {
-		for {
+		ticker := time.NewTicker(time.Minute)
+		for ; ; <-ticker.C {
 			checkStart := time.Now()
-			for _, server := range servers {
-				go func(server Server) {
-					log.Printf("testing %s", server.Hash())
+			for _, serverConfig := range serversByHash {
+				go func(serverConfig *ServerConfig) {
+					serverHash := serverConfig.server.Hash()
+					groupName := serverConfig.group.Name
+					log.Printf("group=%s server=%s start testing", groupName, serverHash)
 					var err error
 					var rt int32
+					interval := time.NewTicker(15 * time.Second)
 					for retry := 1; retry <= 3; retry++ {
-						retryStart := time.Now().Unix()
-						rt, err = server.Test()
+						rt, err = serverConfig.server.Test()
 						if err != nil {
-							remain := time.Duration(15 - (time.Now().Unix() - retryStart))
-							log.Printf("#%d %s rt: %d ms, error: %v, sleep %ds", retry, server.Hash(), rt, err, remain)
+							log.Printf("group=%s server=%s retry#%d rt: %d ms, error: %v",
+								groupName, serverHash, retry, rt, err)
 							rt = -1
-							if remain > 0 {
-								time.Sleep(remain * time.Second)
-							}
+							<-interval.C
 						} else {
-							log.Printf("#%d %s rt: %d ms", retry, server.Hash(), rt)
+							log.Printf("group=%s server=%s retry#%d rt: %d ms",
+								groupName, serverHash, retry, rt)
 							break
 						}
 					}
-					resultChan <- benchmarkResult{server.Hash(), rt, checkStart}
-				}(server)
+					interval.Stop()
+					resultChan <- benchmarkResult{serverHash, rt, checkStart}
+				}(serverConfig)
 			}
-			time.Sleep(1 * time.Minute)
 		}
-
 	}()
 }
 
 func loadFiles() {
 	now := time.Now()
-	for len(rows) < cfg.OldestHistory {
+	for globalDataRows.Len() < globalConfig.OldestHistory {
 		path := filepath.Join(baseDirPath, dataFileName(now))
 		if stat, err := os.Stat(path); err != nil || stat.IsDir() {
 			log.Printf("file %s not exist", path)
@@ -566,7 +625,7 @@ func loadFiles() {
 			defer f.Close()
 			scanner := bufio.NewScanner(f)
 			for scanner.Scan() {
-				line := scanner.Text()
+				line := strings.TrimSpace(scanner.Text())
 				firstIdx := strings.Index(line, ",")
 				if firstIdx < 0 {
 					log.Printf("line %s cant find first comma", line)
@@ -584,8 +643,8 @@ func loadFiles() {
 					continue
 				}
 				hash := line[firstIdx+1 : secondIdx]
-				if _, ok := serversHashSet[hash]; !ok {
-					log.Printf("hash %s not exist in config.yaml", hash)
+				if _, ok := serversByHash[hash]; !ok {
+					log.Printf("line %s hash %s not exist in config.yaml", line, hash)
 					continue
 				}
 				rtStr := line[secondIdx+1:]
@@ -621,11 +680,11 @@ func startHTTPServer() {
 		}
 		_, _ = io.Copy(w, f)
 	})
-	if !strings.Contains(cfg.HttpPort, ":") {
-		cfg.HttpPort = ":" + cfg.HttpPort
+	if !strings.Contains(globalConfig.HttpPort, ":") {
+		globalConfig.HttpPort = ":" + globalConfig.HttpPort
 	}
-	server := &http.Server{Addr: cfg.HttpPort, Handler: nil}
-	ln, err := net.Listen("tcp", cfg.HttpPort)
+	server := &http.Server{Addr: globalConfig.HttpPort, Handler: nil}
+	ln, err := net.Listen("tcp", globalConfig.HttpPort)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -641,7 +700,7 @@ func main() {
 	var err error
 	readConfig()
 	log.Printf("base dir: %s", baseDirPath)
-	log.Printf("oldest history in minutes: %d", cfg.OldestHistory)
+	log.Printf("oldest history in minutes: %d", globalConfig.OldestHistory)
 	baseDirFile, err = os.Open(baseDirPath)
 	if err != nil {
 		log.Fatalf("open %s: %v", baseDirPath, err)
