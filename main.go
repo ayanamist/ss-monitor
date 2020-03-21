@@ -79,7 +79,7 @@ var (
 		Timeout: 5 * time.Second,
 	}
 
-	ssrLocalIp = binary.BigEndian.Uint32([]byte(net.ParseIP("127.0.1.0").To4()))
+	ssrLocalIp = binary.BigEndian.Uint32(net.ParseIP("127.0.1.0").To4())
 )
 
 type Server interface {
@@ -108,7 +108,7 @@ type SsrServer struct {
 
 func (s *SsrServer) restartProcess() error {
 	if s.cmd != nil {
-		s.cmd.Process.Kill()
+		_ = s.cmd.Process.Kill()
 		if err := s.cmd.Wait(); err != nil {
 			if eer, ok := err.(*exec.ExitError); ok {
 				if status, ok := eer.Sys().(syscall.WaitStatus); ok {
@@ -199,8 +199,8 @@ func (s *SsrServer) Test() (rt int32, err error) {
 	resp, err := tr.RoundTrip(req)
 	rt = int32(time.Now().Sub(startTime) / time.Millisecond)
 	if resp != nil {
-		io.Copy(ioutil.Discard, resp.Body)
-		resp.Body.Close()
+		_, _ = io.Copy(ioutil.Discard, resp.Body)
+		_ = resp.Body.Close()
 	}
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "connection refused") {
@@ -321,7 +321,7 @@ func readConfig() {
 	if err != nil {
 		log.Fatalf("read %s: %v", path, err)
 	}
-	if err := yaml.Unmarshal([]byte(b), &cfg); err != nil {
+	if err := yaml.Unmarshal(b, &cfg); err != nil {
 		log.Fatalf("parse json: %v", err)
 	}
 	cfg.HttpPort = strings.TrimSpace(cfg.HttpPort)
@@ -377,7 +377,7 @@ func dataFileName(t time.Time) string {
 func rotateDataFile(oldFile *os.File) (*os.File, error) {
 	newFileName := dataFileName(time.Now())
 	if oldFile != nil {
-		oldFile.Sync()
+		_ = oldFile.Sync()
 		if filepath.Base(oldFile.Name()) == newFileName {
 			return oldFile, nil
 		}
@@ -388,7 +388,7 @@ func rotateDataFile(oldFile *os.File) (*os.File, error) {
 		return nil, err
 	}
 	log.Printf("rotate to %s", newFileName)
-	baseDirFile.Sync()
+	_ = baseDirFile.Sync()
 	return f, nil
 
 }
@@ -610,7 +610,7 @@ func startHTTPServer() {
 		f, err := os.Open(filepath.Join(baseDirPath, indexFile))
 		if err != nil {
 			w.WriteHeader(http.StatusNotFound)
-			w.Write([]byte("not found"))
+			_, _ = w.Write([]byte("not found"))
 			return
 		}
 		defer f.Close()
@@ -619,7 +619,7 @@ func startHTTPServer() {
 		if err == nil {
 			w.Header().Set("Content-Length", strconv.FormatInt(stat.Size(), 10))
 		}
-		io.Copy(w, f)
+		_, _ = io.Copy(w, f)
 	})
 	if !strings.Contains(cfg.HttpPort, ":") {
 		cfg.HttpPort = ":" + cfg.HttpPort
@@ -647,7 +647,7 @@ func main() {
 		log.Fatalf("open %s: %v", baseDirPath, err)
 	}
 	defer func() {
-		baseDirFile.Sync()
+		_ = baseDirFile.Sync()
 		baseDirFile.Close()
 	}()
 	loadFiles()
