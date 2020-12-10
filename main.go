@@ -307,6 +307,9 @@ func convertBase64URL(s string) string {
 }
 
 func b64SafeDecode(s string) (string, error) {
+	if s == "" {
+		return "", nil
+	}
 	var decodeFunc func(s string) ([]byte, error)
 	if s[len(s)-1] == byte(base64.StdPadding) {
 		decodeFunc = base64.URLEncoding.DecodeString
