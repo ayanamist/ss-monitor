@@ -5,8 +5,6 @@ import (
 	"container/list"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -16,17 +14,15 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
-	"golang.org/x/net/proxy"
+	ss "github.com/shadowsocks/go-shadowsocks2/core"
+	"github.com/shadowsocks/go-shadowsocks2/socks"
 	"gopkg.in/yaml.v2"
 )
 
@@ -84,8 +80,6 @@ var (
 	globalDialer = &net.Dialer{
 		Timeout: 5 * time.Second,
 	}
-
-	ssrLocalIp = binary.BigEndian.Uint32(net.ParseIP("127.0.1.0").To4())
 )
 
 type Server interface {
@@ -94,110 +88,39 @@ type Server interface {
 	Name() string
 }
 
-type SsrServer struct {
-	Server        string `json:"server"`
-	ServerPort    int    `json:"server_port"`
-	Method        string `json:"method"`
-	Password      string `json:"password"`
-	Protocol      string `json:"protocol"`
-	ProtocolParam string `json:"protocol_param"`
-	Obfs          string `json:"obfs"`
-	ObfsParam     string `json:"obfs_param"`
-	LocalAddr     string `json:"local_address"`
-	LocalPort     int    `json:"local_port"`
+type SsServer struct {
+	Server     string `json:"server"`
+	ServerPort int    `json:"server_port"`
+	Method     string `json:"method"`
+	Password   string `json:"password"`
 
-	name string `json:"-"`
-	hash string `json:"-"`
-
-	cmd *exec.Cmd `json:"-"`
+	name   string
+	hash   string
+	cipher ss.Cipher
 }
 
-func (s *SsrServer) restartProcess() error {
-	if s.cmd != nil {
-		_ = s.cmd.Process.Kill()
-		if err := s.cmd.Wait(); err != nil {
-			if eer, ok := err.(*exec.ExitError); ok {
-				if status, ok := eer.Sys().(syscall.WaitStatus); ok {
-					if status.Signaled() {
-						switch status.Signal() {
-						case syscall.SIGKILL, syscall.SIGTERM, syscall.SIGINT:
-							err = nil
-						}
-					}
-				}
-			}
-			if err != nil {
-				log.Printf("%s exit: %v", s.Hash(), err)
-			}
-		}
-		s.cmd = nil
-	}
-
-	l, err := net.Listen("tcp", s.LocalAddr+":0")
-	if err != nil {
-		return errors.Wrap(err, "try local port")
-	}
-	_, portStr, _ := net.SplitHostPort(l.Addr().String())
-	l.Close()
-
-	s.LocalPort, _ = strconv.Atoi(portStr)
-
-	confBytes, _ := json.Marshal(s)
-	f, err := ioutil.TempFile("", "ssr_config")
-	if err != nil {
-		return errors.Wrap(err, "open temp file")
-	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	if _, err := f.Write(confBytes); err != nil {
-		return errors.Wrap(err, "write temp file")
-	}
-
-	cmd := exec.Command("sslocal", "-c", f.Name())
-	stdoutPr, err := cmd.StdoutPipe()
-	if err != nil {
-		return errors.Wrap(err, "cmd.StdoutPipe")
-	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
-		return errors.Wrap(err, "start sslocal")
-	}
-
-	go func() {
-		scanner := bufio.NewScanner(stdoutPr)
-		for scanner.Scan() {
-			log.Printf("%s:%d stdout: %s", s.Server, s.ServerPort, scanner.Text())
-		}
-	}()
-
-	addr := fmt.Sprintf("%s:%d", s.LocalAddr, s.LocalPort)
-
-	var isListening bool
-	for i := 0; i < 50; i++ {
-		c, err := globalDialer.Dial("tcp4", addr)
-		if err == nil {
-			c.Close()
-			isListening = true
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !isListening {
-		return errors.Errorf("%s not listening %s", s.Hash(), addr)
-	}
-	s.cmd = cmd
-	return nil
-}
-
-func (s *SsrServer) Test() (rt int32, err error) {
-	dialer, _ := proxy.SOCKS5("tcp4", fmt.Sprintf("%s:%d", s.LocalAddr, s.LocalPort), nil, globalDialer)
+func (s *SsServer) Test() (rt int32, err error) {
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.Dial(network, addr)
+			c, err := globalDialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", s.Server, s.ServerPort))
+			if err != nil {
+				return nil, errors.Wrap(err, "globalDialer.DialContext")
+			}
+			c = s.cipher.StreamConn(c)
+			rawaddr := socks.ParseAddr(addr)
+			if len(rawaddr) == 0 {
+				c.Close()
+				return nil, errors.Errorf("invalid addr %s", addr)
+			}
+			if _, err := c.Write(rawaddr); err != nil {
+				c.Close()
+				return nil, errors.Wrap(err, "c.Write")
+			}
+			return c, nil
 		},
 		ResponseHeaderTimeout: 10 * time.Second,
 	}
-	req, err := http.NewRequest("GET", globalConfig.CheckURL, nil)
+	req, err := http.NewRequest(http.MethodHead, globalConfig.CheckURL, nil)
 	if err != nil {
 		return -1, errors.Wrap(err, "new http request")
 	}
@@ -209,26 +132,21 @@ func (s *SsrServer) Test() (rt int32, err error) {
 		_ = resp.Body.Close()
 	}
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "connection refused") {
-			if err := s.restartProcess(); err != nil {
-				log.Printf("%s restartProcess: %v", s.Hash(), err)
-			}
-		}
 		return rt, errors.Wrapf(err, "roundtrip")
 	}
 	return rt, nil
 }
 
-func (s *SsrServer) Hash() string {
+func (s *SsServer) Hash() string {
 	return s.hash
 }
 
-func (s *SsrServer) Name() string {
+func (s *SsServer) Name() string {
 	return s.name
 }
 
 func newServerFromURL(name, rawurl string) (_ Server, err error) {
-	s := &SsrServer{}
+	s := &SsServer{}
 	if strings.HasPrefix(rawurl, "ss://") {
 		u, err := url.Parse(rawurl)
 		if err != nil {
@@ -249,45 +167,15 @@ func newServerFromURL(name, rawurl string) (_ Server, err error) {
 		}
 		s.Method = u.User.Username()
 		s.Password, _ = u.User.Password()
-		s.Obfs = "plain"
-		s.Protocol = "origin"
-	} else if strings.HasPrefix(rawurl, "ssr://") {
-		parts := strings.SplitN(rawurl, "/", 4)
-		if len(parts) < 3 {
-			return nil, errors.Errorf("invalid ssr url %s", rawurl)
-		} else if len(parts) == 3 {
-			parts = append(parts, "")
-		}
-		splitted := strings.Split(parts[2], ":")
-		if len(splitted) != 6 {
-			return nil, errors.Errorf("invalid ssr host")
-		}
-		s.Server = splitted[0]
-		s.ServerPort, err = strconv.Atoi(splitted[1])
+		s.cipher, err = ss.PickCipher(s.Method, nil, s.Password)
 		if err != nil {
-			return nil, errors.Wrap(err, "port invalid "+splitted[1])
+			return nil, errors.Wrap(err, "ss.PickCipher")
 		}
-		s.Protocol = splitted[2]
-		s.Method = splitted[3]
-		s.Obfs = splitted[4]
-		s.Password, err = b64SafeDecode(splitted[5])
-		if err != nil {
-			return nil, errors.Wrapf(err, "invalid base64pass: %s", splitted[5])
-		}
-		query, err := url.ParseQuery(strings.TrimLeft(parts[3], "?"))
-		if err != nil {
-			return nil, err
-		}
-		s.ObfsParam, _ = b64SafeDecode(query.Get("obfsparam"))
-		s.ProtocolParam, _ = b64SafeDecode(query.Get("protoparam"))
 	} else {
 		return nil, errors.Errorf("unsupported scheme %s", rawurl)
 	}
 	s.name = name
 	s.hash = fmt.Sprintf("%s:%d", s.Server, s.ServerPort)
-	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, atomic.AddUint32(&ssrLocalIp, 1))
-	s.LocalAddr = net.IP(buf).String()
 	return s, nil
 }
 
