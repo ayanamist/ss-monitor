@@ -285,7 +285,7 @@ func dropTimeSecond(t time.Time) time.Time {
 var resultChan = make(chan benchmarkResult)
 
 func dataFileName(t time.Time) string {
-	return fmt.Sprintf("data.%s.csv", t.Format("2006-01-02"))
+	return fmt.Sprintf("data.%s.csv", t.Local().Format("2006-01-02"))
 }
 
 func rotateDataFile(oldFile *os.File) *os.File {
@@ -341,7 +341,7 @@ func renderIndexTmp() error {
 		}
 		GeneratedTime string
 	}{}
-	data.GeneratedTime = time.Now().Format("01-02 15:04:05")
+	data.GeneratedTime = time.Now().Local().Format("01-02 15:04:05")
 	for _, group := range globalConfig.SiteGroups {
 		serverNames := make([]string, len(group.Servers))
 		for i, v := range group.Servers {
@@ -361,7 +361,7 @@ func renderIndexTmp() error {
 	}
 	for e := globalDataRows.Front(); e != nil; e = e.Next() {
 		row := e.Value.(*dataRow)
-		timestamp := time.Unix(row.timestamp, 0).Format("01-02 15:04")
+		timestamp := time.Unix(row.timestamp, 0).Local().Format("01-02 15:04")
 		for i, group := range globalConfig.SiteGroups {
 			rts := make([]int32, len(group.Servers))
 			for j, serverConfig := range group.Servers {
