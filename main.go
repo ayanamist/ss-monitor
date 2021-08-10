@@ -210,7 +210,7 @@ func b64SafeDecode(s string) (string, error) {
 
 func readConfig() {
 	var err error
-	baseDirPath, err = filepath.Abs(filepath.Dir(os.Args[0]))
+	baseDirPath, err = os.Getwd()
 	if err != nil {
 		panic(err)
 	}
