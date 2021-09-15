@@ -18,17 +18,21 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/pkg/errors"
-	ss "github.com/shadowsocks/go-shadowsocks2/core"
-	"github.com/shadowsocks/go-shadowsocks2/socks"
+	"github.com/Dreamacro/clash/config"
+	ss "github.com/Dreamacro/go-shadowsocks2/core"
+	"github.com/Dreamacro/go-shadowsocks2/socks"
+	"github.com/go-resty/resty/v2"
 	"gopkg.in/yaml.v2"
 )
 
 type SiteGroup struct {
-	Name    string          `yaml:"name"`
-	Servers []*ServerConfig `yaml:"servers"`
+	Name              string          `yaml:"name"`
+	ClashSubscribeUrl string          `yaml:"clash_subscribe_url"`
+	Servers           []*ServerConfig `yaml:"servers"`
+	serversMutex      sync.RWMutex
 }
 
 type ServerConfig struct {
@@ -60,8 +64,9 @@ type dataRow struct {
 }
 
 const (
-	indexFile       = "index.html"
-	defaultCheckURL = "http://www.google.com/generate_204"
+	indexFile = "index.html"
+
+	defaultCheckURL = "http://connectivitycheck.gstatic.com/generate_204"
 )
 
 type empty struct {
@@ -70,7 +75,8 @@ type empty struct {
 var (
 	globalConfig = &Config{}
 
-	serversByHash = make(map[string]*ServerConfig)
+	serversByHash      = make(map[string]*ServerConfig)
+	serversByHashMutex sync.RWMutex
 
 	baseDirPath string
 	baseDirFile *os.File
@@ -80,6 +86,8 @@ var (
 	globalDialer = &net.Dialer{
 		Timeout: 5 * time.Second,
 	}
+
+	globalRestyClient = resty.New().SetDisableWarn(true).SetTimeout(15 * time.Second)
 )
 
 type Server interface {
@@ -97,42 +105,44 @@ type SsServer struct {
 	name   string
 	hash   string
 	cipher ss.Cipher
+	tr     http.RoundTripper
 }
 
-func (s *SsServer) Test() (rt int32, err error) {
-	tr := &http.Transport{
+func getTransport(s *SsServer) http.RoundTripper {
+	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			c, err := globalDialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", s.Server, s.ServerPort))
 			if err != nil {
-				return nil, errors.Wrap(err, "globalDialer.DialContext")
+				return nil, fmt.Errorf("globalDialer.DialContext: %w", err)
 			}
 			c = s.cipher.StreamConn(c)
 			rawaddr := socks.ParseAddr(addr)
 			if len(rawaddr) == 0 {
 				c.Close()
-				return nil, errors.Errorf("invalid addr %s", addr)
+				return nil, fmt.Errorf("invalid addr %s", addr)
 			}
 			if _, err := c.Write(rawaddr); err != nil {
 				c.Close()
-				return nil, errors.Wrap(err, "c.Write")
+				return nil, fmt.Errorf("c.Write: %w", err)
 			}
 			return c, nil
 		},
-		ResponseHeaderTimeout: 10 * time.Second,
+		DisableKeepAlives: true,
 	}
-	req, err := http.NewRequest(http.MethodHead, globalConfig.CheckURL, nil)
-	if err != nil {
-		return -1, errors.Wrap(err, "new http request")
-	}
+}
+
+func (s *SsServer) Test() (rt int32, err error) {
+	client := resty.New().SetDisableWarn(true).SetTransport(s.tr).
+		SetDoNotParseResponse(true).SetCloseConnection(true).SetRedirectPolicy(resty.NoRedirectPolicy()).
+		SetTimeout(15 * time.Second).RemoveProxy()
 	startTime := time.Now()
-	resp, err := tr.RoundTrip(req)
+	resp, err := client.R().Head(globalConfig.CheckURL)
 	rt = int32(time.Now().Sub(startTime) / time.Millisecond)
 	if resp != nil {
-		_, _ = io.Copy(ioutil.Discard, resp.Body)
-		_ = resp.Body.Close()
+		_ = resp.RawBody().Close()
 	}
 	if err != nil {
-		return rt, errors.Wrapf(err, "roundtrip")
+		return rt, fmt.Errorf("roundtrip: %w", err)
 	}
 	return rt, nil
 }
@@ -154,25 +164,26 @@ func newServerFromURL(name, rawurl string) (_ Server, err error) {
 		}
 		host, portStr, err := net.SplitHostPort(u.Host)
 		if err != nil {
-			return nil, errors.Wrap(err, "split host port "+u.Host)
+			return nil, fmt.Errorf("split host port %s: %w", u.Host, err)
 		}
 		port, err := strconv.Atoi(portStr)
 		if err != nil {
-			return nil, errors.Wrap(err, "port invalid "+portStr)
+			return nil, fmt.Errorf("port invalid %s: %w", portStr, err)
 		}
 		s.Server = host
 		s.ServerPort = port
 		if u.User == nil {
-			return nil, errors.Errorf("empty method password")
+			return nil, fmt.Errorf("empty method password")
 		}
 		s.Method = u.User.Username()
 		s.Password, _ = u.User.Password()
 		s.cipher, err = ss.PickCipher(s.Method, nil, s.Password)
 		if err != nil {
-			return nil, errors.Wrap(err, "ss.PickCipher")
+			return nil, fmt.Errorf("ss.PickCipher: %w", err)
 		}
+		s.tr = getTransport(s)
 	} else {
-		return nil, errors.Errorf("unsupported scheme %s", rawurl)
+		return nil, fmt.Errorf("unsupported scheme %s", rawurl)
 	}
 	s.name = name
 	s.hash = fmt.Sprintf("%s:%d", s.Server, s.ServerPort)
@@ -244,37 +255,8 @@ func readConfig() {
 	if globalConfig.CheckURL == "" {
 		globalConfig.CheckURL = defaultCheckURL
 	}
-	for _, group := range globalConfig.SiteGroups {
-		group.Name = strings.TrimSpace(group.Name)
-		if group.Name == "" {
-			log.Fatalf("group name must be specified: %#v", group)
-		}
-		for _, serverConfig := range group.Servers {
-			namesSet := make(map[string]empty)
-			serverConfig.Name = strings.TrimSpace(serverConfig.Name)
-			if serverConfig.Name == "" {
-				log.Fatalf("server name must be specified: %#v", serverConfig)
-			}
-			if _, ok := namesSet[serverConfig.Name]; ok {
-				log.Fatalf("server name %s must be group unique", serverConfig.Name)
-			}
-			namesSet[serverConfig.Name] = empty{}
-			urlStr := convertBase64URL(strings.TrimSpace(serverConfig.Url))
-			server, err := newServerFromURL(serverConfig.Name, urlStr)
-			if err != nil {
-				log.Fatalf("new serverConfig error %s: %v", urlStr, err)
-			}
-			hash := server.Hash()
-			if _, ok := serversByHash[hash]; ok {
-				log.Fatalf("server %s hash must be global unique", serverConfig.Name)
-			}
-			tmpConfig := serverConfig
-			tmpConfig.server = server
-			tmpConfig.group = &SiteGroup{
-				Name: group.Name,
-			}
-			serversByHash[hash] = tmpConfig
-		}
+	if err := reinitServersByHash(); err != nil {
+		log.Fatalf("reinitServersByHash error: %v", err)
 	}
 }
 
@@ -402,10 +384,13 @@ func renderIndexTmp() error {
 }
 
 func insertResultIntoRows(result benchmarkResult) (curRowComplete bool) {
+	serversByHashMutex.RLock()
 	if _, ok := serversByHash[result.hash]; !ok {
+		serversByHashMutex.RUnlock()
 		log.Printf("unknown hash and discard: %#v", result)
 		return false
 	}
+	serversByHashMutex.RUnlock()
 
 	rowTimestamp := dropTimeSecond(result.startTime).Unix()
 	var row *dataRow
@@ -436,9 +421,13 @@ func insertResultIntoRows(result benchmarkResult) (curRowComplete bool) {
 		}
 	}
 	row.columns[result.hash] = result.rt
+	serversByHashMutex.RLock()
 	if len(row.columns) < len(serversByHash) {
+		serversByHashMutex.RUnlock()
 		return false
 	}
+	serversByHashMutex.RUnlock()
+
 	for globalDataRows.Len() >= globalConfig.OldestHistory {
 		if e := globalDataRows.Back(); e != nil {
 			globalDataRows.Remove(e)
@@ -468,9 +457,19 @@ func startCheckers() {
 
 	go func() {
 		ticker := time.NewTicker(time.Minute)
-		for ; ; <-ticker.C {
+		for range ticker.C {
+			if err := reinitServersByHash(); err != nil {
+				log.Printf("reinitServersByHash error: %v", err)
+			}
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		for range ticker.C {
 			checkStart := time.Now()
-			for _, serverConfig := range serversByHash {
+			serversByHash2 := copyServersByHash()
+			for _, serverConfig := range serversByHash2 {
 				go func(serverConfig *ServerConfig) {
 					serverHash := serverConfig.server.Hash()
 					groupName := serverConfig.group.Name
@@ -502,7 +501,82 @@ func startCheckers() {
 	}()
 }
 
+func copyServersByHash() map[string]*ServerConfig {
+	serversByHashMutex.RLock()
+	serversByHash2 := make(map[string]*ServerConfig, len(serversByHash))
+	for k, v := range serversByHash {
+		serversByHash2[k] = v
+	}
+	serversByHashMutex.RUnlock()
+	return serversByHash2
+}
+
+func reinitServersByHash() error {
+	serversByHash2 := make(map[string]*ServerConfig)
+	for _, group := range globalConfig.SiteGroups {
+		group.Name = strings.TrimSpace(group.Name)
+		if group.Name == "" {
+			return fmt.Errorf("group name must be specified: %#v", group)
+		}
+		var servers []*ServerConfig
+		if group.ClashSubscribeUrl != "" {
+			resp, err := globalRestyClient.R().Get(group.ClashSubscribeUrl)
+			if err != nil {
+				log.Printf("get %s error: %v", group.ClashSubscribeUrl, err)
+			} else if clashConfig, err := config.UnmarshalRawConfig(resp.Body()); err != nil {
+				log.Printf("config.Parse %s error: %v\n%s", group.ClashSubscribeUrl, err, resp.String())
+			} else {
+				servers = make([]*ServerConfig, len(clashConfig.Proxy))
+				for i, proxy := range clashConfig.Proxy {
+					servers[i] = &ServerConfig{
+						Name: proxy["name"].(string),
+						Url:  fmt.Sprintf("%s://%s:%s@%s:%d", proxy["type"], proxy["cipher"], proxy["password"], proxy["server"], proxy["port"]),
+					}
+				}
+				group.serversMutex.Lock()
+				group.Servers = servers
+				group.serversMutex.Unlock()
+			}
+		} else {
+			group.serversMutex.RLock()
+			servers = group.Servers
+			group.serversMutex.RUnlock()
+		}
+		for _, serverConfig := range servers {
+			namesSet := make(map[string]empty)
+			serverConfig.Name = strings.TrimSpace(serverConfig.Name)
+			if serverConfig.Name == "" {
+				return fmt.Errorf("server name must be specified: %#v", serverConfig)
+			}
+			if _, ok := namesSet[serverConfig.Name]; ok {
+				return fmt.Errorf("server name %s must be group unique", serverConfig.Name)
+			}
+			namesSet[serverConfig.Name] = empty{}
+			urlStr := convertBase64URL(strings.TrimSpace(serverConfig.Url))
+			server, err := newServerFromURL(serverConfig.Name, urlStr)
+			if err != nil {
+				return fmt.Errorf("new serverConfig error %s: %v", urlStr, err)
+			}
+			hash := server.Hash()
+			if _, ok := serversByHash2[hash]; ok {
+				return fmt.Errorf("server %s hash must be global unique", serverConfig.Name)
+			}
+			tmpConfig := serverConfig
+			tmpConfig.server = server
+			tmpConfig.group = &SiteGroup{
+				Name: group.Name,
+			}
+			serversByHash2[hash] = tmpConfig
+		}
+	}
+	serversByHashMutex.Lock()
+	serversByHash = serversByHash2
+	serversByHashMutex.Unlock()
+	return nil
+}
+
 func loadFiles() {
+	serversByHash2 := copyServersByHash()
 	now := time.Now()
 	for globalDataRows.Len() < globalConfig.OldestHistory {
 		path := filepath.Join(baseDirPath, dataFileName(now))
@@ -537,7 +611,7 @@ func loadFiles() {
 					continue
 				}
 				hash := line[firstIdx+1 : secondIdx]
-				if _, ok := serversByHash[hash]; !ok {
+				if _, ok := serversByHash2[hash]; !ok {
 					log.Printf("line %s hash %s not exist in config.yaml", line, hash)
 					continue
 				}
