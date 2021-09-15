@@ -140,7 +140,7 @@ func (s *SsServer) Test() (rt int32, err error) {
 	startTime := time.Now()
 	resp, err := client.R().Head(globalConfig.CheckURL)
 	rt = int32(time.Now().Sub(startTime) / time.Millisecond)
-	if resp != nil {
+	if resp != nil && resp.RawBody() != nil {
 		_ = resp.RawBody().Close()
 	}
 	if err != nil {
