@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"container/list"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"io"
@@ -255,7 +257,7 @@ func readConfig() {
 	if globalConfig.CheckURL == "" {
 		globalConfig.CheckURL = defaultCheckURL
 	}
-	if err := reinitServersByHash(); err != nil {
+	if err := reinitServersByHash(true); err != nil {
 		log.Fatalf("reinitServersByHash error: %v", err)
 	}
 }
@@ -268,6 +270,11 @@ var resultChan = make(chan benchmarkResult)
 
 func dataFileName(t time.Time) string {
 	return fmt.Sprintf("data.%s.csv", t.Local().Format("2006-01-02"))
+}
+
+func clashSubscribeCacheFileName(urlStr string) string {
+	bytes := sha256.Sum256([]byte(urlStr))
+	return fmt.Sprintf(".%s.clash_cache", hex.EncodeToString(bytes[:]))
 }
 
 func rotateDataFile(oldFile *os.File) *os.File {
@@ -456,9 +463,9 @@ func startCheckers() {
 	}()
 
 	go func() {
-		ticker := time.NewTicker(time.Minute)
+		ticker := time.NewTicker(15 * time.Minute)
 		for range ticker.C {
-			if err := reinitServersByHash(); err != nil {
+			if err := reinitServersByHash(false); err != nil {
 				log.Printf("reinitServersByHash error: %v", err)
 			}
 		}
@@ -511,7 +518,7 @@ func copyServersByHash() map[string]*ServerConfig {
 	return serversByHash2
 }
 
-func reinitServersByHash() error {
+func reinitServersByHash(first bool) error {
 	serversByHash2 := make(map[string]*ServerConfig)
 	for _, group := range globalConfig.SiteGroups {
 		group.Name = strings.TrimSpace(group.Name)
@@ -520,23 +527,44 @@ func reinitServersByHash() error {
 		}
 		var servers []*ServerConfig
 		if group.ClashSubscribeUrl != "" {
+			if first && len(group.Servers) > 0 {
+				log.Printf("group %s has clash_subscribe_url %s and will ignore servers", group.Name, group.ClashSubscribeUrl)
+			}
+			var clashConfig *config.RawConfig
+			cacheFileName := clashSubscribeCacheFileName(group.ClashSubscribeUrl)
+
 			resp, err := globalRestyClient.R().Get(group.ClashSubscribeUrl)
 			if err != nil {
-				log.Printf("get %s error: %v", group.ClashSubscribeUrl, err)
-			} else if clashConfig, err := config.UnmarshalRawConfig(resp.Body()); err != nil {
-				log.Printf("config.Parse %s error: %v\n%s", group.ClashSubscribeUrl, err, resp.String())
+				log.Printf("fetch %s error: %v", group.ClashSubscribeUrl, err)
+			} else if clashConfig, err = config.UnmarshalRawConfig(resp.Body()); err != nil {
+				log.Printf("parse %s error: %v\n%s", group.ClashSubscribeUrl, err, resp.String())
 			} else {
-				servers = make([]*ServerConfig, len(clashConfig.Proxy))
-				for i, proxy := range clashConfig.Proxy {
-					servers[i] = &ServerConfig{
-						Name: proxy["name"].(string),
-						Url:  fmt.Sprintf("%s://%s:%s@%s:%d", proxy["type"], proxy["cipher"], proxy["password"], proxy["server"], proxy["port"]),
-					}
-				}
-				group.serversMutex.Lock()
-				group.Servers = servers
-				group.serversMutex.Unlock()
+				_ = ioutil.WriteFile(cacheFileName, resp.Body(), 0644)
 			}
+			if clashConfig == nil {
+				if buf, err := ioutil.ReadFile(cacheFileName); err == nil {
+					if clashConfig, err = config.UnmarshalRawConfig(buf); err != nil {
+						log.Printf("parse cache %s for %s error: %v", cacheFileName, group.ClashSubscribeUrl, err)
+					}
+				} else if !os.IsNotExist(err) {
+					log.Printf("read cache %s for %s error: %v", cacheFileName, group.ClashSubscribeUrl, err)
+				}
+			}
+			if clashConfig == nil {
+				log.Printf("group %s fetch subscription %s error and ignore", group.Name, group.ClashSubscribeUrl)
+				continue
+			}
+
+			servers = make([]*ServerConfig, len(clashConfig.Proxy))
+			for i, proxy := range clashConfig.Proxy {
+				servers[i] = &ServerConfig{
+					Name: proxy["name"].(string),
+					Url:  fmt.Sprintf("%s://%s:%s@%s:%d", proxy["type"], proxy["cipher"], proxy["password"], proxy["server"], proxy["port"]),
+				}
+			}
+			group.serversMutex.Lock()
+			group.Servers = servers
+			group.serversMutex.Unlock()
 		} else {
 			group.serversMutex.RLock()
 			servers = group.Servers
