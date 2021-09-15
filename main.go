@@ -332,8 +332,12 @@ func renderIndexTmp() error {
 	}{}
 	data.GeneratedTime = time.Now().Local().Format("01-02 15:04:05")
 	for _, group := range globalConfig.SiteGroups {
-		serverNames := make([]string, len(group.Servers))
-		for i, v := range group.Servers {
+		group.serversMutex.RLock()
+		servers := make([]*ServerConfig, len(group.Servers))
+		copy(servers, group.Servers)
+		group.serversMutex.RUnlock()
+		serverNames := make([]string, len(servers))
+		for i, v := range servers {
 			serverNames[i] = v.Name
 		}
 		data.Groups = append(data.Groups, struct {
@@ -352,8 +356,12 @@ func renderIndexTmp() error {
 		row := e.Value.(*dataRow)
 		timestamp := time.Unix(row.timestamp, 0).Local().Format("01-02 15:04")
 		for i, group := range globalConfig.SiteGroups {
-			rts := make([]int32, len(group.Servers))
-			for j, serverConfig := range group.Servers {
+			group.serversMutex.RLock()
+			servers := make([]*ServerConfig, len(group.Servers))
+			copy(servers, group.Servers)
+			group.serversMutex.RUnlock()
+			rts := make([]int32, len(servers))
+			for j, serverConfig := range servers {
 				rt := row.columns[serverConfig.server.Hash()]
 				rts[j] = rt
 			}
@@ -423,7 +431,6 @@ func insertResultIntoRows(result benchmarkResult) (curRowComplete bool) {
 			}
 		}
 		if row == nil {
-			log.Printf("WARN too old data and discard: %#v", result)
 			return false
 		}
 	}
