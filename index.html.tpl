@@ -4,7 +4,7 @@
 <title>System Status</title>
 <meta charset="UTF-8"/>
 <meta http-equiv="X-UA-Compatible" content="IE=10; IE=9; IE=8; IE=7; IE=EDGE"/>
-<link rel="stylesheet" type="text/css" href="https://cdn.staticfile.org/bootstrap/4.6.2/css/bootstrap.min.css"/>
+<link rel="stylesheet" type="text/css" href="https://lf3-cdn-tos.bytecdntp.com/cdn/expire-1-M/bootstrap/4.6.1/css/bootstrap.min.css"/>
 <style>
     .navbar .nav {
         width: calc(100% - 12em);
@@ -57,9 +57,9 @@
     </div>
     {{- end }}
 </div>
-<script type="text/javascript" src="https://cdn.staticfile.org/jquery/2.2.4/jquery.min.js"></script>
-<script type="text/javascript" src="https://cdn.staticfile.org/floatthead/2.2.4/jquery.floatThead.min.js"></script>
-<script type="text/javascript" src="https://cdn.staticfile.org/bootstrap/4.6.2/js/bootstrap.bundle.min.js"></script>
+<script type="text/javascript" src="https://lf3-cdn-tos.bytecdntp.com/cdn/expire-1-M/jquery/2.2.4/jquery.min.js"></script>
+<script type="text/javascript" src="https://lf3-cdn-tos.bytecdntp.com/cdn/expire-1-M/floatthead/2.2.4/jquery.floatThead.min.js"></script>
+<script type="text/javascript" src="https://lf3-cdn-tos.bytecdntp.com/cdn/expire-1-M/bootstrap/4.6.1/js/bootstrap.bundle.min.js"></script>
 <script type="text/javascript">
 $(function(){$('table.table').floatThead({position: 'fixed'});});
 </script>
