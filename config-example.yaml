@@ -1,16 +1,10 @@
-http_port: 127.0.0.1:0
+http_port: 127.0.0.1:8080
 oldest_history: 60
-slow_threshold: 5000
-sites:
-  - name: group1
-    servers:
-      - name: server1
-        url: ss://method:password@host1:port
-      - name: server2
-        url: ss://method:password@host2:port
-  - name: group2
-    servers:
-      - name: server3
-        url: ss://method:password@host1:port
-      - name: server4
-        url: ss://method:password@host2:port
+slow_threshold: 400
+show_rt: true
+check_url: "https://i.ytimg.com/generate_204"
+groups:
+  - name: 机场名字
+    clash_api: "http://127.0.0.1:1234/"
+    clash_secret: "xxxxxx"
+    provider: "foobar"

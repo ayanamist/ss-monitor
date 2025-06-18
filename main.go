@@ -1,48 +1,32 @@
 package main
 
 import (
-	"bufio"
-	"container/list"
-	"context"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
+	"encoding/csv"
 	"fmt"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Dreamacro/clash/config"
-	ss "github.com/Dreamacro/go-shadowsocks2/core"
-	"github.com/Dreamacro/go-shadowsocks2/socks"
+	"github.com/emirpasic/gods/v2/maps/treemap"
 	"github.com/go-resty/resty/v2"
 	"gopkg.in/yaml.v2"
 )
 
 type SiteGroup struct {
-	Name              string          `yaml:"name"`
-	ClashSubscribeUrl string          `yaml:"clash_subscribe_url"`
-	Servers           []*ServerConfig `yaml:"servers"`
-	serversMutex      sync.RWMutex
-}
-
-type ServerConfig struct {
-	Name    string `yaml:"name"`
-	Url     string `yaml:"url"`
-	server  Server
-	group   *SiteGroup
-	results []benchmarkResult
+	Name        string `yaml:"name"`
+	ClashApi    string `yaml:"clash_api"`
+	ClashSecret string `yaml:"clash_secret"`
+	Provider    string `yaml:"provider"`
 }
 
 type Config struct {
@@ -55,171 +39,51 @@ type Config struct {
 }
 
 type benchmarkResult struct {
-	hash      string
+	key       providerKey
+	name      string
 	rt        int32
 	startTime time.Time
 }
 
+type providerKey struct {
+	ClashApi string
+	Provider string
+}
+
 type dataRow struct {
 	timestamp int64
-	columns   map[string]int32 // map[serverHash]rt
+	columns   map[string]int32 // map[name]rt
 }
+
+type empty struct{}
 
 const (
 	indexFile = "index.html"
 
-	defaultCheckURL = "http://connectivitycheck.gstatic.com/generate_204"
+	defaultCheckURL = "https://i.ytimg.com/generate_204"
 )
-
-type empty struct {
-}
 
 var (
 	globalConfig = &Config{}
 
-	serversByHash      = make(map[string]*ServerConfig)
-	serversByHashMutex sync.RWMutex
-
 	baseDirPath string
 	baseDirFile *os.File
 
-	globalDataRows = list.New()
+	globalDataRows   = make(map[providerKey]*treemap.Map[int64, map[string]int32]) // map[providerKey]map[timestamp]map[name]rt
+	globalProxyNames = make(map[providerKey][]string)
+	globalDataMutex  = &sync.RWMutex{}
 
 	globalDialer = &net.Dialer{
 		Timeout: 5 * time.Second,
 	}
 
-	globalRestyClient = resty.New().SetDisableWarn(true).SetTimeout(15 * time.Second)
-)
-
-type Server interface {
-	Test() (rt int32, err error)
-	Hash() string
-	Name() string
-}
-
-type SsServer struct {
-	Server     string `json:"server"`
-	ServerPort int    `json:"server_port"`
-	Method     string `json:"method"`
-	Password   string `json:"password"`
-
-	name   string
-	hash   string
-	cipher ss.Cipher
-	tr     http.RoundTripper
-}
-
-func getTransport(s *SsServer) http.RoundTripper {
-	return &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			c, err := globalDialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", s.Server, s.ServerPort))
-			if err != nil {
-				return nil, fmt.Errorf("globalDialer.DialContext: %w", err)
-			}
-			c = s.cipher.StreamConn(c)
-			rawaddr := socks.ParseAddr(addr)
-			if len(rawaddr) == 0 {
-				c.Close()
-				return nil, fmt.Errorf("invalid addr %s", addr)
-			}
-			if _, err := c.Write(rawaddr); err != nil {
-				c.Close()
-				return nil, fmt.Errorf("c.Write: %w", err)
-			}
-			return c, nil
-		},
+	globalRestyClient = resty.New().SetDisableWarn(true).SetTimeout(15 * time.Second).SetTransport(&http.Transport{
+		DialContext:       globalDialer.DialContext,
 		DisableKeepAlives: true,
-	}
-}
-
-func (s *SsServer) Test() (rt int32, err error) {
-	client := resty.New().SetDisableWarn(true).SetTransport(s.tr).
-		SetDoNotParseResponse(true).SetCloseConnection(true).SetRedirectPolicy(resty.NoRedirectPolicy()).
-		SetTimeout(15 * time.Second).RemoveProxy()
-	startTime := time.Now()
-	resp, err := client.R().Head(globalConfig.CheckURL)
-	rt = int32(time.Now().Sub(startTime) / time.Millisecond)
-	if resp != nil && resp.RawBody() != nil {
-		_ = resp.RawBody().Close()
-	}
-	if err != nil {
-		return rt, fmt.Errorf("roundtrip: %w", err)
-	}
-	return rt, nil
-}
-
-func (s *SsServer) Hash() string {
-	return s.hash
-}
-
-func (s *SsServer) Name() string {
-	return s.name
-}
-
-func newServerFromURL(name, rawurl string) (_ Server, err error) {
-	s := &SsServer{}
-	if strings.HasPrefix(rawurl, "ss://") {
-		u, err := url.Parse(rawurl)
-		if err != nil {
-			return nil, err
-		}
-		host, portStr, err := net.SplitHostPort(u.Host)
-		if err != nil {
-			return nil, fmt.Errorf("split host port %s: %w", u.Host, err)
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("port invalid %s: %w", portStr, err)
-		}
-		s.Server = host
-		s.ServerPort = port
-		if u.User == nil {
-			return nil, fmt.Errorf("empty method password")
-		}
-		s.Method = u.User.Username()
-		s.Password, _ = u.User.Password()
-		s.cipher, err = ss.PickCipher(s.Method, nil, s.Password)
-		if err != nil {
-			return nil, fmt.Errorf("ss.PickCipher: %w", err)
-		}
-		s.tr = getTransport(s)
-	} else {
-		return nil, fmt.Errorf("unsupported scheme %s", rawurl)
-	}
-	s.name = name
-	s.hash = fmt.Sprintf("%s:%d", s.Server, s.ServerPort)
-	return s, nil
-}
-
-func convertBase64URL(s string) string {
-	originalURL := s
-	parts := strings.SplitAfterN(s, "//", 2)
-	if len(parts) < 2 {
-		return s
-	}
-	decoded, err := b64SafeDecode(parts[1])
-	if err != nil {
-		return s
-	}
-	s = parts[0] + decoded
-	log.Printf("converted %s -> %s", originalURL, s)
-	return s
-}
-
-func b64SafeDecode(s string) (string, error) {
-	if s == "" {
-		return "", nil
-	}
-	var decodeFunc func(s string) ([]byte, error)
-	if s[len(s)-1] == byte(base64.StdPadding) {
-		decodeFunc = base64.URLEncoding.DecodeString
-	} else {
-		decodeFunc = base64.RawURLEncoding.DecodeString
-	}
-	b, err := decodeFunc(s)
-	return string(b), err
-}
+	}).SetRetryCount(3).SetRetryWaitTime(200 * time.Millisecond).AddRetryCondition(func(response *resty.Response, err error) bool {
+		return err != nil
+	})
+)
 
 func readConfig() {
 	var err error
@@ -236,7 +100,7 @@ func readConfig() {
 		}
 		path = filepath.Join(baseDirPath, "config.yaml")
 	}
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatalf("read %s: %v", path, err)
 	}
@@ -257,24 +121,29 @@ func readConfig() {
 	if globalConfig.CheckURL == "" {
 		globalConfig.CheckURL = defaultCheckURL
 	}
-	if err := reinitServersByHash(true); err != nil {
-		log.Fatalf("reinitServersByHash error: %v", err)
+	for _, group := range globalConfig.SiteGroups {
+		if group.Name == "" {
+			log.Fatalf("group name must be specified")
+		}
+		if api := strings.TrimSuffix(group.ClashApi, "/"); api == "" {
+			log.Fatalf("clash_api for group %s must be specified", group.Name)
+		} else {
+			group.ClashApi = api
+		}
+		if group.Provider == "" {
+			log.Fatalf("provider for group %s must be specified", group.Name)
+		}
+		globalDataRows[providerKey{
+			ClashApi: group.ClashApi,
+			Provider: group.Provider,
+		}] = treemap.New[int64, map[string]int32]()
 	}
-}
-
-func dropTimeSecond(t time.Time) time.Time {
-	return time.Unix(t.Unix()-int64(t.Second()), 0)
 }
 
 var resultChan = make(chan benchmarkResult)
 
 func dataFileName(t time.Time) string {
 	return fmt.Sprintf("data.%s.csv", t.Local().Format("2006-01-02"))
-}
-
-func clashSubscribeCacheFileName(urlStr string) string {
-	bytes := sha256.Sum256([]byte(urlStr))
-	return fmt.Sprintf(".%s.clash_cache", hex.EncodeToString(bytes[:]))
 }
 
 func rotateDataFile(oldFile *os.File) *os.File {
@@ -285,9 +154,10 @@ func rotateDataFile(oldFile *os.File) *os.File {
 		}
 		_ = oldFile.Sync()
 		oldFile.Close()
+		os.Remove(dataFileName(time.Now().AddDate(0, 0, -2)))
 	}
 	newPath := filepath.Join(baseDirPath, newFileName)
-	f, err := os.OpenFile(newPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(newPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("rotateDataFile to %s error: %s", newPath, err)
 	}
@@ -331,14 +201,33 @@ func renderIndexTmp() error {
 		GeneratedTime string
 	}{}
 	data.GeneratedTime = time.Now().Local().Format("01-02 15:04:05")
+	globalDataMutex.RLock()
 	for _, group := range globalConfig.SiteGroups {
-		group.serversMutex.RLock()
-		servers := make([]*ServerConfig, len(group.Servers))
-		copy(servers, group.Servers)
-		group.serversMutex.RUnlock()
-		serverNames := make([]string, len(servers))
-		for i, v := range servers {
-			serverNames[i] = v.Name
+		l := globalProxyNames[providerKey{ClashApi: group.ClashApi, Provider: group.Provider}]
+		serverNames := make([]string, len(l))
+		copy(serverNames, l)
+		var rows []struct {
+			Time   string
+			RtList []int32
+		}
+		dataRows := globalDataRows[providerKey{ClashApi: group.ClashApi, Provider: group.Provider}]
+		it := dataRows.Iterator()
+		it.End()
+		for it.Prev() {
+			timestamp := it.Key()
+			row := it.Value()
+			if len(row) == 0 {
+				continue // skip empty rows
+			}
+			timestampStr := time.Unix(timestamp, 0).Local().Format("01-02 15:04")
+			rts := make([]int32, len(serverNames))
+			for i, name := range serverNames {
+				rts[i] = row[name]
+			}
+			rows = append(rows, struct {
+				Time   string
+				RtList []int32
+			}{Time: timestampStr, RtList: rts})
 		}
 		data.Groups = append(data.Groups, struct {
 			Name        string
@@ -350,27 +239,11 @@ func renderIndexTmp() error {
 		}{
 			Name:        group.Name,
 			ServerNames: serverNames,
+			Rows:        rows,
 		})
 	}
-	for e := globalDataRows.Front(); e != nil; e = e.Next() {
-		row := e.Value.(*dataRow)
-		timestamp := time.Unix(row.timestamp, 0).Local().Format("01-02 15:04")
-		for i, group := range globalConfig.SiteGroups {
-			group.serversMutex.RLock()
-			servers := make([]*ServerConfig, len(group.Servers))
-			copy(servers, group.Servers)
-			group.serversMutex.RUnlock()
-			rts := make([]int32, len(servers))
-			for j, serverConfig := range servers {
-				rt := row.columns[serverConfig.server.Hash()]
-				rts[j] = rt
-			}
-			data.Groups[i].Rows = append(data.Groups[i].Rows, struct {
-				Time   string
-				RtList []int32
-			}{Time: timestamp, RtList: rts})
-		}
-	}
+	globalDataMutex.RUnlock()
+
 	tplFile := indexFile + ".tpl"
 	tpl, err := template.New(tplFile).Funcs(map[string]interface{}{
 		"isRtSlow": func(rt int32) bool {
@@ -399,54 +272,33 @@ func renderIndexTmp() error {
 }
 
 func insertResultIntoRows(result benchmarkResult) (curRowComplete bool) {
-	serversByHashMutex.RLock()
-	if _, ok := serversByHash[result.hash]; !ok {
-		serversByHashMutex.RUnlock()
-		log.Printf("unknown hash and discard: %#v", result)
-		return false
+	globalDataMutex.Lock()
+	defer globalDataMutex.Unlock()
+	dataRows := globalDataRows[result.key]
+	rowTimestamp := result.startTime.Truncate(time.Minute).Unix()
+	if minKey, _, ok := dataRows.Min(); ok && minKey > rowTimestamp {
+		return false // skip if the row is too old
 	}
-	serversByHashMutex.RUnlock()
-
-	rowTimestamp := dropTimeSecond(result.startTime).Unix()
-	var row *dataRow
-	if globalDataRows.Front() == nil {
-		row = &dataRow{
-			timestamp: rowTimestamp,
-			columns:   make(map[string]int32),
-		}
-		globalDataRows.PushFront(row)
-	} else {
-		for e := globalDataRows.Front(); e != nil; e = e.Next() {
-			tmpRow := e.Value.(*dataRow)
-			if tmpRow.timestamp < rowTimestamp {
-				row = &dataRow{
-					timestamp: rowTimestamp,
-					columns:   make(map[string]int32),
-				}
-				globalDataRows.PushFront(row)
-				break
-			} else if tmpRow.timestamp == rowTimestamp {
-				row = tmpRow
+	row, ok := dataRows.Get(rowTimestamp)
+	if !ok {
+		row = make(map[string]int32)
+		dataRows.Put(rowTimestamp, row)
+		for dataRows.Size() >= globalConfig.OldestHistory {
+			if minKey, _, ok := dataRows.Min(); ok {
+				dataRows.Remove(minKey)
+			} else {
 				break
 			}
 		}
-		if row == nil {
-			return false
-		}
 	}
-	row.columns[result.hash] = result.rt
-	serversByHashMutex.RLock()
-	if len(row.columns) < len(serversByHash) {
-		serversByHashMutex.RUnlock()
-		return false
-	}
-	serversByHashMutex.RUnlock()
 
-	for globalDataRows.Len() >= globalConfig.OldestHistory {
-		if e := globalDataRows.Back(); e != nil {
-			globalDataRows.Remove(e)
-		} else {
-			break
+	row[result.name] = result.rt
+
+	if names := globalProxyNames[result.key]; len(names) > 0 {
+		for _, k := range names {
+			if _, ok := row[k]; !ok {
+				return false
+			}
 		}
 	}
 	return true
@@ -456,11 +308,12 @@ func startCheckers() {
 	go func() {
 		f := rotateDataFile(nil)
 		defer f.Close()
+		csvWriter := csv.NewWriter(f)
 		for result := range resultChan {
-			line := fmt.Sprintf("%d,%s,%d\n", result.startTime.Unix(), result.hash, result.rt)
-			if _, err := f.WriteString(line); err != nil {
-				log.Println(err)
-				continue
+			if err := csvWriter.Write([]string{strconv.FormatInt(result.startTime.Unix(), 10), strconv.FormatInt(int64(result.rt), 10), result.key.ClashApi, result.key.Provider, result.name}); err != nil {
+				log.Printf("csv write error: %v", err)
+			} else {
+				csvWriter.Flush()
 			}
 			if insertResultIntoRows(result) {
 				f = rotateDataFile(f)
@@ -470,150 +323,83 @@ func startCheckers() {
 	}()
 
 	go func() {
-		ticker := time.NewTicker(15 * time.Minute)
-		for range ticker.C {
-			if err := reinitServersByHash(false); err != nil {
-				log.Printf("reinitServersByHash error: %v", err)
-			}
-		}
-	}()
-
-	go func() {
 		ticker := time.NewTicker(time.Minute)
 		for range ticker.C {
 			checkStart := time.Now()
-			serversByHash2 := copyServersByHash()
-			for _, serverConfig := range serversByHash2 {
-				go func(serverConfig *ServerConfig) {
-					serverHash := serverConfig.server.Hash()
-					groupName := serverConfig.group.Name
-					log.Printf("group=%s server=%s start testing", groupName, serverHash)
-					var err error
-					var rt int32
-					interval := time.NewTicker(15 * time.Second)
-					for retry := 1; ; retry++ {
-						rt, err = serverConfig.server.Test()
-						if err != nil {
-							log.Printf("group=%s server=%s retry#%d rt: %d ms, error: %v",
-								groupName, serverHash, retry, rt, err)
-							rt = -1
-						} else {
-							log.Printf("group=%s server=%s retry#%d rt: %d ms",
-								groupName, serverHash, retry, rt)
-							break
-						}
-						if retry >= 3 {
-							break
-						}
-						<-interval.C
+			for _, group := range globalConfig.SiteGroups {
+				go func(group *SiteGroup) {
+					var proxiesResponse struct {
+						Proxies []struct {
+							Name string `json:"name"`
+						} `json:"proxies"`
 					}
-					interval.Stop()
-					resultChan <- benchmarkResult{serverHash, rt, checkStart}
-				}(serverConfig)
+					r := globalRestyClient.R().ExpectContentType("application/json").SetResult(&proxiesResponse)
+					if group.ClashSecret != "" {
+						r.SetHeader("Authorization", "Bearer "+group.ClashSecret)
+					}
+					log.Printf("group=%s get proxies", group.Name)
+					resp, err := r.Get(group.ClashApi + "/providers/proxies/" + url.PathEscape(group.Provider))
+					if err != nil {
+						log.Printf("group=%s get proxies error: %v", group.Name, err)
+						return
+					}
+					if resp.IsError() {
+						log.Printf("group=%s get proxies error: %s", group.Name, resp)
+						return
+					}
+					if len(proxiesResponse.Proxies) == 0 {
+						log.Printf("group=%s no proxies found for provider %s: %s", group.Name, group.Provider, resp)
+						return
+					}
+					proxyNames := make([]string, len(proxiesResponse.Proxies))
+					for i, proxy := range proxiesResponse.Proxies {
+						proxyNames[i] = proxy.Name
+					}
+					key := providerKey{ClashApi: group.ClashApi, Provider: group.Provider}
+					globalDataMutex.Lock()
+					globalProxyNames[key] = proxyNames
+					globalDataMutex.Unlock()
+					for _, name := range proxyNames {
+						go func(key providerKey, name string) {
+							var delayResponse struct {
+								Delay *int32 `json:"delay"`
+							}
+							r := globalRestyClient.R().ExpectContentType("application/json").SetResult(&delayResponse)
+							if group.ClashSecret != "" {
+								r.SetHeader("Authorization", "Bearer "+group.ClashSecret)
+							}
+							log.Printf("group=%s get delay for %s ", group.Name, name)
+							resp, err := r.SetQueryParams(map[string]string{
+								"url":     globalConfig.CheckURL,
+								"timeout": "14000", // 14 seconds
+							}).Get(group.ClashApi + "/proxies/" + url.PathEscape(name) + "/delay")
+							delay := int32(-1)
+							if err == nil && delayResponse.Delay != nil {
+								delay = *delayResponse.Delay
+							} else {
+								log.Printf("group=%s get delay for %s error: %v %v", group.Name, name, err, resp)
+							}
+							resultChan <- benchmarkResult{key, name, delay, checkStart}
+						}(key, name)
+					}
+				}(group)
 			}
 		}
 	}()
 }
 
-func copyServersByHash() map[string]*ServerConfig {
-	serversByHashMutex.RLock()
-	serversByHash2 := make(map[string]*ServerConfig, len(serversByHash))
-	for k, v := range serversByHash {
-		serversByHash2[k] = v
-	}
-	serversByHashMutex.RUnlock()
-	return serversByHash2
-}
-
-func reinitServersByHash(first bool) error {
-	serversByHash2 := make(map[string]*ServerConfig)
-	for _, group := range globalConfig.SiteGroups {
-		group.Name = strings.TrimSpace(group.Name)
-		if group.Name == "" {
-			return fmt.Errorf("group name must be specified: %#v", group)
-		}
-		var servers []*ServerConfig
-		if group.ClashSubscribeUrl != "" {
-			if first && len(group.Servers) > 0 {
-				log.Printf("group %s has clash_subscribe_url %s and will ignore servers", group.Name, group.ClashSubscribeUrl)
-			}
-			var clashConfig *config.RawConfig
-			cacheFileName := clashSubscribeCacheFileName(group.ClashSubscribeUrl)
-
-			resp, err := globalRestyClient.R().Get(group.ClashSubscribeUrl)
-			if err != nil {
-				log.Printf("fetch %s error: %v", group.ClashSubscribeUrl, err)
-			} else if clashConfig, err = config.UnmarshalRawConfig(resp.Body()); err != nil {
-				log.Printf("parse %s error: %v\n%s", group.ClashSubscribeUrl, err, resp.String())
-			} else {
-				_ = ioutil.WriteFile(cacheFileName, resp.Body(), 0644)
-			}
-			if clashConfig == nil {
-				if buf, err := ioutil.ReadFile(cacheFileName); err == nil {
-					if clashConfig, err = config.UnmarshalRawConfig(buf); err != nil {
-						log.Printf("parse cache %s for %s error: %v", cacheFileName, group.ClashSubscribeUrl, err)
-					}
-				} else if !os.IsNotExist(err) {
-					log.Printf("read cache %s for %s error: %v", cacheFileName, group.ClashSubscribeUrl, err)
-				}
-			}
-			if clashConfig == nil {
-				log.Printf("group %s fetch subscription %s error and ignore", group.Name, group.ClashSubscribeUrl)
-				continue
-			}
-
-			servers = make([]*ServerConfig, len(clashConfig.Proxy))
-			for i, proxy := range clashConfig.Proxy {
-				servers[i] = &ServerConfig{
-					Name: proxy["name"].(string),
-					Url:  fmt.Sprintf("%s://%s:%s@%s:%d", proxy["type"], proxy["cipher"], proxy["password"], proxy["server"], proxy["port"]),
-				}
-			}
-			group.serversMutex.Lock()
-			group.Servers = servers
-			group.serversMutex.Unlock()
-		} else {
-			group.serversMutex.RLock()
-			servers = group.Servers
-			group.serversMutex.RUnlock()
-		}
-		for _, serverConfig := range servers {
-			namesSet := make(map[string]empty)
-			serverConfig.Name = strings.TrimSpace(serverConfig.Name)
-			if serverConfig.Name == "" {
-				return fmt.Errorf("server name must be specified: %#v", serverConfig)
-			}
-			if _, ok := namesSet[serverConfig.Name]; ok {
-				return fmt.Errorf("server name %s must be group unique", serverConfig.Name)
-			}
-			namesSet[serverConfig.Name] = empty{}
-			urlStr := convertBase64URL(strings.TrimSpace(serverConfig.Url))
-			server, err := newServerFromURL(serverConfig.Name, urlStr)
-			if err != nil {
-				return fmt.Errorf("new serverConfig error %s: %v", urlStr, err)
-			}
-			hash := server.Hash()
-			if _, ok := serversByHash2[hash]; ok {
-				return fmt.Errorf("server %s hash must be global unique", serverConfig.Name)
-			}
-			tmpConfig := serverConfig
-			tmpConfig.server = server
-			tmpConfig.group = &SiteGroup{
-				Name: group.Name,
-			}
-			serversByHash2[hash] = tmpConfig
-		}
-	}
-	serversByHashMutex.Lock()
-	serversByHash = serversByHash2
-	serversByHashMutex.Unlock()
-	return nil
-}
-
 func loadFiles() {
-	serversByHash2 := copyServersByHash()
 	now := time.Now()
-	for globalDataRows.Len() < globalConfig.OldestHistory {
+	minLen := func() int {
+		n := math.MaxInt
+		for _, l := range globalDataRows {
+			if l.Size() < n {
+				n = l.Size()
+			}
+		}
+		return n
+	}
+	for minLen() < globalConfig.OldestHistory {
 		path := filepath.Join(baseDirPath, dataFileName(now))
 		if stat, err := os.Stat(path); err != nil || stat.IsDir() {
 			log.Printf("file %s not exist", path)
@@ -626,41 +412,28 @@ func loadFiles() {
 		}
 		func() {
 			defer f.Close()
-			scanner := bufio.NewScanner(f)
-			for scanner.Scan() {
-				line := strings.TrimSpace(scanner.Text())
-				firstIdx := strings.Index(line, ",")
-				if firstIdx < 0 {
-					log.Printf("line %s cant find first comma", line)
-					continue
-				}
-				tsStr := line[:firstIdx]
-				timestamp, err := strconv.ParseUint(tsStr, 10, 0)
+			csvReader := csv.NewReader(f)
+			csvReader.FieldsPerRecord = 5 // timestamp, rt, clash_url, provider, proxyName
+			for {
+				records, err := csvReader.Read()
 				if err != nil {
-					log.Printf("strconv timestamp %s error: %v", tsStr, err)
-					continue
+					if err != io.EOF {
+						log.Printf("csv read %s error: %v", f.Name(), err)
+					}
+					break
 				}
-				secondIdx := strings.LastIndex(line, ",")
-				if secondIdx == firstIdx {
-					log.Printf("line %s cant find last comma", line)
-					continue
-				}
-				hash := line[firstIdx+1 : secondIdx]
-				if _, ok := serversByHash2[hash]; !ok {
-					log.Printf("line %s hash %s not exist in config.yaml", line, hash)
-					continue
-				}
-				rtStr := line[secondIdx+1:]
-				rt, err := strconv.ParseInt(rtStr, 10, 0)
+				timestamp, err := strconv.ParseInt(records[0], 10, 0)
 				if err != nil {
-					log.Printf("strconv rt %s error: %v", rtStr, err)
+					log.Printf("strconv timestamp %s error: %v", records[0], err)
 					continue
 				}
-				result := benchmarkResult{hash, int32(rt), time.Unix(int64(timestamp), 0)}
+				rt, err := strconv.ParseInt(records[1], 10, 0)
+				if err != nil {
+					log.Printf("strconv rt %s error: %v", records[2], err)
+					continue
+				}
+				result := benchmarkResult{key: providerKey{ClashApi: records[2], Provider: records[3]}, name: records[4], rt: int32(rt), startTime: time.Unix(timestamp, 0)}
 				insertResultIntoRows(result)
-			}
-			if err := scanner.Err(); err != nil {
-				log.Printf("scan %s: %v", f.Name(), err)
 			}
 			now = now.AddDate(0, 0, -1)
 		}()
@@ -698,7 +471,6 @@ func startHTTPServer() {
 }
 
 func main() {
-	runtime.GOMAXPROCS(1)
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 	var err error
 	readConfig()
