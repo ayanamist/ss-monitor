@@ -57,7 +57,7 @@
     </div>
     {{- end }}
 </div>
-<script type="text/javascript" src="https://cdnjs.quickso.cn/ajax/libs/jquery/2.2.5/jquery.min.js"></script>
+<script type="text/javascript" src="https://cdnjs.quickso.cn/ajax/libs/jquery/2.2.4/jquery.min.js"></script>
 <script type="text/javascript" src="https://cdnjs.quickso.cn/ajax/libs/floatthead/2.2.5/jquery.floatThead.min.js"></script>
 <script type="text/javascript" src="https://cdnjs.quickso.cn/ajax/libs/bootstrap/4.6.1/js/bootstrap.bundle.min.js"></script>
 <script type="text/javascript">
