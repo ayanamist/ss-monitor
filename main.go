@@ -372,7 +372,7 @@ func startCheckers() {
 							resp, err := r.SetQueryParams(map[string]string{
 								"url":     globalConfig.CheckURL,
 								"timeout": "14000", // 14 seconds
-							}).Get(group.ClashApi + "/proxies/" + url.PathEscape(name) + "/delay")
+							}).Get(group.ClashApi + "/providers/proxies/" + url.PathEscape(group.Provider) + "/" + url.PathEscape(name) + "/healthcheck")
 							delay := int32(-1)
 							if err == nil && delayResponse.Delay != nil {
 								delay = *delayResponse.Delay
