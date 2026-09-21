@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -146,14 +147,33 @@ func dataFileName(t time.Time) string {
 	return fmt.Sprintf("data.%s.csv", t.Local().Format("2006-01-02"))
 }
 
-func rotateDataFile(oldFile *os.File) *os.File {
+type csvDataFile struct {
+	file   *os.File
+	writer *csv.Writer
+}
+
+func (f *csvDataFile) Write(record []string) error {
+	if err := f.writer.Write(record); err != nil {
+		return err
+	}
+	f.writer.Flush()
+	return f.writer.Error()
+}
+
+func (f *csvDataFile) Close() error {
+	f.writer.Flush()
+	return errors.Join(f.writer.Error(), f.file.Sync(), f.file.Close())
+}
+
+func rotateDataFile(oldFile *csvDataFile) *csvDataFile {
 	newFileName := dataFileName(time.Now())
 	if oldFile != nil {
-		if filepath.Base(oldFile.Name()) == newFileName {
+		if filepath.Base(oldFile.file.Name()) == newFileName {
 			return oldFile
 		}
-		_ = oldFile.Sync()
-		oldFile.Close()
+		if err := oldFile.Close(); err != nil {
+			log.Printf("close data file %s error: %v", oldFile.file.Name(), err)
+		}
 		os.Remove(dataFileName(time.Now().AddDate(0, 0, -2)))
 	}
 	newPath := filepath.Join(baseDirPath, newFileName)
@@ -163,7 +183,7 @@ func rotateDataFile(oldFile *os.File) *os.File {
 	}
 	log.Printf("rotate to %s", newFileName)
 	_ = baseDirFile.Sync()
-	return f
+	return &csvDataFile{file: f, writer: csv.NewWriter(f)}
 
 }
 
@@ -306,17 +326,18 @@ func insertResultIntoRows(result benchmarkResult) (curRowComplete bool) {
 
 func startCheckers() {
 	go func() {
-		f := rotateDataFile(nil)
-		defer f.Close()
-		csvWriter := csv.NewWriter(f)
+		dataFile := rotateDataFile(nil)
+		defer func() {
+			if err := dataFile.Close(); err != nil {
+				log.Printf("close data file %s error: %v", dataFile.file.Name(), err)
+			}
+		}()
 		for result := range resultChan {
-			if err := csvWriter.Write([]string{strconv.FormatInt(result.startTime.Unix(), 10), strconv.FormatInt(int64(result.rt), 10), result.key.ClashApi, result.key.Provider, result.name}); err != nil {
+			if err := dataFile.Write([]string{strconv.FormatInt(result.startTime.Unix(), 10), strconv.FormatInt(int64(result.rt), 10), result.key.ClashApi, result.key.Provider, result.name}); err != nil {
 				log.Printf("csv write error: %v", err)
-			} else {
-				csvWriter.Flush()
 			}
 			if insertResultIntoRows(result) {
-				f = rotateDataFile(f)
+				dataFile = rotateDataFile(dataFile)
 				renderIndex()
 			}
 		}
